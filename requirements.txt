@@ -1,0 +1,5 @@
+aiogram==3.17.0
+git+https://github.com/yt-dlp/yt-dlp.git@master
+python-dotenv==1.0.1
+shazamio
+aiosqlite==0.21.0

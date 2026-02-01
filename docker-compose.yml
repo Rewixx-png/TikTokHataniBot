@@ -1,0 +1,10 @@
+services:
+  tt-bot:
+    build: .
+    container_name: tt_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/app/downloads
+      - ./cookies.txt:/app/cookies.txt
