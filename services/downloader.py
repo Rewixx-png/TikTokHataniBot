@@ -7,6 +7,20 @@ import time
 from yt_dlp import YoutubeDL
 from core.config import DOWNLOAD_DIR
 
+def parse_fps(fps_str: str) -> int:
+    """Safely parse FPS from ffprobe output string."""
+    if not fps_str or fps_str == '0/0':
+        return 0
+    try:
+        if '/' in fps_str:
+            num, den = map(int, fps_str.split('/'))
+            if den > 0:
+                return round(num / den)
+            return 0
+        return round(float(fps_str))
+    except (ValueError, ZeroDivisionError):
+        return 0
+
 class TikTokDownloader:
     def __init__(self):
         self.download_path = DOWNLOAD_DIR
@@ -18,22 +32,25 @@ class TikTokDownloader:
                 'ffprobe', 
                 '-v', 'error', 
                 '-select_streams', 'v:0', 
-                '-show_entries', 'stream=width,height,r_frame_rate,duration', 
+                '-show_entries', 'stream=width,height,r_frame_rate,avg_frame_rate,duration', 
                 '-of', 'json', 
                 file_path
             ]
 
             result = subprocess.run(cmd, capture_output=True, text=True)
+            if not result.stdout:
+                return {}
+            
             data = json.loads(result.stdout)
+            if 'streams' not in data or not data['streams']:
+                return {}
 
             stream = data['streams'][0]
 
-            fps_str = stream.get('r_frame_rate', '0/0')
-            if '/' in fps_str:
-                num, den = map(int, fps_str.split('/'))
-                fps = int(num / den) if den > 0 else 0
-            else:
-                fps = int(float(fps_str))
+            # Try r_frame_rate first, fallback to avg_frame_rate
+            fps = parse_fps(stream.get('r_frame_rate'))
+            if fps == 0:
+                fps = parse_fps(stream.get('avg_frame_rate'))
 
             return {
                 'width': int(stream.get('width', 0)),

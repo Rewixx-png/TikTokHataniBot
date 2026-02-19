@@ -3,6 +3,7 @@ import re
 import time
 import datetime
 import asyncio
+import html
 from aiogram import Router, F, types
 from aiogram.filters import CommandStart
 from aiogram.types import FSInputFile
@@ -40,6 +41,8 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
     uploader_name = info.get('uploader', 'Unknown')
     uploader_id = info.get('uploader_id', 'unknown')
     description = info.get('description', '')
+    # Escape HTML entities in user-generated content
+    description = html.escape(description)
     if len(description) > 150:
         description = description[:147] + "..."
     
@@ -54,6 +57,8 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
     height = info.get('height', 0)
     fps = info.get('fps', 0)
     song_name = info.get('song_name', 'Original Sound')
+    # Escape song name too
+    song_name = html.escape(song_name)
     
     location_line = f"📅 {upload_date}"
     if country_code and country_code != "Unknown":
