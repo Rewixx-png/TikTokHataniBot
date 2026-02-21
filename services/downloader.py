@@ -8,7 +8,6 @@ from yt_dlp import YoutubeDL
 from core.config import DOWNLOAD_DIR
 
 def parse_fps(fps_str: str) -> int:
-    """Safely parse FPS from ffprobe output string."""
     if not fps_str or fps_str == '0/0':
         return 0
     try:
@@ -18,7 +17,7 @@ def parse_fps(fps_str: str) -> int:
                 return round(num / den)
             return 0
         return round(float(fps_str))
-    except (ValueError, ZeroDivisionError):
+    except (ValueError, ZeroDivisionError, TypeError):
         return 0
 
 class TikTokDownloader:
@@ -47,7 +46,6 @@ class TikTokDownloader:
 
             stream = data['streams'][0]
 
-            # Try r_frame_rate first, fallback to avg_frame_rate
             fps = parse_fps(stream.get('r_frame_rate'))
             if fps == 0:
                 fps = parse_fps(stream.get('avg_frame_rate'))
@@ -121,10 +119,10 @@ class TikTokDownloader:
                     'repost_count': info.get('repost_count', 0),
                     'upload_date': info.get('upload_date'),
                     'detected_country': country,
-                    'width': local_info.get('width', info.get('width', 0)),
-                    'height': local_info.get('height', info.get('height', 0)),
-                    'fps': local_info.get('fps', info.get('fps', 0)),
-                    'duration': local_info.get('duration', info.get('duration', 0)),
+                    'width': local_info.get('width') or info.get('width') or 0,
+                    'height': local_info.get('height') or info.get('height') or 0,
+                    'fps': local_info.get('fps') or info.get('fps') or 0,
+                    'duration': local_info.get('duration') or info.get('duration') or 0,
                 }
 
                 return result

@@ -41,7 +41,6 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
     uploader_name = info.get('uploader', 'Unknown')
     uploader_id = info.get('uploader_id', 'unknown')
     description = info.get('description', '')
-    # Escape HTML entities in user-generated content
     description = html.escape(description)
     if len(description) > 150:
         description = description[:147] + "..."
@@ -57,7 +56,6 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
     height = info.get('height', 0)
     fps = info.get('fps', 0)
     song_name = info.get('song_name', 'Original Sound')
-    # Escape song name too
     song_name = html.escape(song_name)
     
     location_line = f"📅 {upload_date}"
@@ -108,7 +106,6 @@ async def handle_tiktok_link(message: types.Message):
     
     if cached:
         await status_msg.edit_text("📤 <b>Sending from cache...</b>", parse_mode="HTML")
-        upload_start = time.time()
         
         cached['cached'] = True
         cached['url'] = url
