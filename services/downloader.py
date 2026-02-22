@@ -7,16 +7,17 @@ import time
 from yt_dlp import YoutubeDL
 from core.config import DOWNLOAD_DIR
 
-def parse_fps(fps_str: str) -> int:
-    if not fps_str or fps_str == '0/0':
+def parse_fps(fps_str) -> int:
+    if not fps_str or str(fps_str) == '0/0':
         return 0
     try:
-        if '/' in fps_str:
-            num, den = map(int, fps_str.split('/'))
+        val = str(fps_str)
+        if '/' in val:
+            num, den = map(float, val.split('/'))
             if den > 0:
-                return round(num / den)
+                return int(round(num / den))
             return 0
-        return round(float(fps_str))
+        return int(round(float(val)))
     except (ValueError, ZeroDivisionError, TypeError):
         return 0
 
@@ -106,6 +107,26 @@ class TikTokDownloader:
 
                 local_info = self._get_local_video_info(file_path)
 
+                fps_val = local_info.get('fps')
+                if not fps_val:
+                    fps_val = info.get('fps')
+                if not fps_val:
+                    for f in info.get('formats', []):
+                        if f.get('vcodec') != 'none' and f.get('fps'):
+                            fps_val = f.get('fps')
+                            break
+                if not fps_val:
+                    fmt_note = info.get('format_note', '')
+                    if '60' in str(fmt_note):
+                        fps_val = 60
+                    else:
+                        fps_val = 30
+
+                try:
+                    final_fps = int(round(float(fps_val))) if fps_val else 30
+                except (ValueError, TypeError):
+                    final_fps = 30
+
                 result = {
                     'file_path': file_path,
                     'file_size': file_size,
@@ -121,7 +142,7 @@ class TikTokDownloader:
                     'detected_country': country,
                     'width': local_info.get('width') or info.get('width') or 0,
                     'height': local_info.get('height') or info.get('height') or 0,
-                    'fps': local_info.get('fps') or info.get('fps') or 0,
+                    'fps': final_fps,
                     'duration': local_info.get('duration') or info.get('duration') or 0,
                 }
 

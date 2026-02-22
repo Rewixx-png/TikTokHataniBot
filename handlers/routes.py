@@ -63,12 +63,13 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
         location_line += f"  🌍 {country_code}"
     
     cached_mark = " ♻️" if info.get('cached') else ""
+    fps_text = f"{fps}fps | " if fps and fps > 0 else "N/A | "
     
     return (
         f"👤 <b>{uploader_name}</b> (@{uploader_id}){cached_mark}\n\n"
         f"📝 <blockquote expandable>{description}</blockquote>\n\n"
         f"❤️ {likes}  💬 {comments}  🔄 {reposts}\n\n"
-        f"💾 <code>{duration}s | {width}×{height} | {fps}fps | {file_size_mb:.1f}MB</code>\n"
+        f"💾 <code>{duration}s | {width}×{height} | {fps_text}{file_size_mb:.1f}MB</code>\n"
         f"{location_line}\n\n"
         f"🎵 <i>{song_name}</i>\n\n"
         f"🔗 via @{requester}\n\n"
