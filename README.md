@@ -28,12 +28,14 @@
 ## Features
 
 - ⚡ **Instant Delivery** — Videos sent immediately after download, metadata added asynchronously
+- 🎚️ **Quality Picker** — Choose `Normal`, `High`, or `Original` quality before download
+- 🧬 **Original/High Source** — `High` and `Original` use a third-party source; `Original` is sent as file
 - 🎵 **Audio Recognition** — Shazam integration for track identification
 - 💾 **Smart Caching** — SQLite-based cache with 7-day TTL prevents re-downloading same videos
 - 📊 **Rich Metadata** — Likes, comments, reposts, resolution, FPS, file size, upload date
 - 🌍 **Geolocation** — Detects country of upload when available
-- 🐳 **Docker Ready** — One-command deployment with Docker Compose
-- 🔒 **Safe** — Automatic file cleanup, size validation (50MB limit)
+- 🐳 **Docker Ready** — Includes local Telegram Bot API server in Docker Compose
+- 🔒 **Safe** — Automatic file cleanup, configurable max file size
 
 ## Installation
 
@@ -67,7 +69,9 @@ python main.py
 
 1. Start the bot: `/start`
 2. Send any TikTok link (supporting `tiktok.com`, `vm.tiktok.com`, `vt.tiktok.com`)
-3. Bot responds instantly with video, then updates caption with full analytics
+3. Bot checks availability and asks for quality (`Normal`, `High`, `Original`)
+4. `Normal` downloads via TikTok extractor, `High`/`Original` via third-party source
+5. Bot sends media, then updates caption with full analytics
 
 ### Performance Metrics
 
@@ -84,7 +88,8 @@ Cached videos marked with `♻️` and served instantly.
 | Component | Technology |
 |-----------|------------|
 | Framework | [aiogram 3.x](https://docs.aiogram.dev/) |
-| Downloader | [yt-dlp](https://github.com/yt-dlp/yt-dlp) |
+| Downloader | [yt-dlp](https://github.com/yt-dlp/yt-dlp) (`Normal` + probe/metadata) |
+| High/Original mode | Third-party service flow (cloudscraper session) |
 | Audio ID | [Shazamio](https://github.com/dotX12/ShazamIO) |
 | Database | SQLite (aiosqlite) |
 | Deployment | Docker + Docker Compose |
@@ -92,7 +97,7 @@ Cached videos marked with `♻️` and served instantly.
 ## Caching
 
 Bot uses SQLite with following logic:
-- **Key**: Video URL
+- **Key**: `quality|video_url`
 - **Value**: Telegram `file_id` + metadata
 - **TTL**: 7 days (auto cleanup)
 - **LRU**: Access updates timestamp
@@ -104,6 +109,11 @@ Bot uses SQLite with following logic:
 |----------|-------------|----------|
 | `BOT_TOKEN` | Telegram Bot Token from [@BotFather](https://t.me/botfather) | Yes |
 | `DOWNLOAD_DIR` | Download directory (default: `./downloads`) | No |
+| `MAX_FILE_SIZE_MB` | Max upload size in MB (auto defaults to 50 or 2000 in local Bot API mode) | No |
+| `TELEGRAM_API_ID` | Telegram API ID for local Bot API container | For Docker local Bot API |
+| `TELEGRAM_API_HASH` | Telegram API hash for local Bot API container | For Docker local Bot API |
+| `TELEGRAM_BOT_API_BASE_URL` | Custom Bot API base URL (e.g. `http://127.0.0.1:18081`) | No |
+| `TELEGRAM_BOT_API_IS_LOCAL` | Set `1` when using Telegram Bot API in local mode | No |
 
 ## Project Structure
 
@@ -116,7 +126,9 @@ Bot uses SQLite with following logic:
 │   └── routes.py      # Bot command handlers
 ├── services/
 │   ├── audio.py       # Shazam recognition
-│   └── downloader.py  # TikTok download logic
+│   ├── downloader.py  # TikTok downloader (normal + metadata probe)
+│   ├── snaptik.py     # Third-party download flow (high/original)
+│   └── __init__.py
 ├── downloads/         # Temporary download directory
 ├── cookies.txt        # TikTok auth cookies (optional)
 ├── main.py           # Entry point

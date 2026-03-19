@@ -1,12 +1,21 @@
 import asyncio
 import logging
 import sys
+
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
-from core.config import BOT_TOKEN
+
+from core.config import (
+    BOT_TOKEN,
+    TELEGRAM_BOT_API_BASE_URL,
+    TELEGRAM_BOT_API_IS_LOCAL,
+)
 from core.database import init_db
 from handlers.routes import router
+
 
 async def main():
     logging.basicConfig(
@@ -14,21 +23,32 @@ async def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         stream=sys.stdout
     )
-    
+
     await init_db()
-    
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-    )
+
+    bot_kwargs = {
+        'token': BOT_TOKEN,
+        'default': DefaultBotProperties(parse_mode=ParseMode.HTML),
+    }
+
+    if TELEGRAM_BOT_API_BASE_URL:
+        api = TelegramAPIServer.from_base(
+            TELEGRAM_BOT_API_BASE_URL,
+            is_local=TELEGRAM_BOT_API_IS_LOCAL,
+        )
+        bot_kwargs['session'] = AiohttpSession(api=api)
+        logging.info('Using custom Bot API endpoint: %s', TELEGRAM_BOT_API_BASE_URL)
+
+    bot = Bot(**bot_kwargs)
     dp = Dispatcher()
-    
+
     dp.include_router(router)
-    
+
     try:
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
+
 
 if __name__ == "__main__":
     try:
