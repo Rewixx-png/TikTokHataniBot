@@ -460,15 +460,12 @@ async def handle_tiktok_link(message: types.Message):
         'created_at': time.time(),
     }
 
-    title = html.escape(str(probe.get('title', 'TikTok video')))
-    duration = int(normalize_duration_seconds(probe.get('duration', 0)))
-    duration_text = f'{duration}s' if duration > 0 else 'N/A'
-
     await status_msg.edit_text(
         '✅ <b>Видео найдено</b>\n'
-        f'📝 <blockquote expandable>{title}</blockquote>\n'
-        f'⏱️ {duration_text}\n\n'
-        'Выбери качество:',
+        'Выбери качество:\n\n'
+        '📉 <b>Обычное</b> - Скачаем по обычному через yt-dlp\n'
+        '⚡ <b>Высокое</b> - Скачаем через сторонний сервис с максимальным качеством\n'
+        '🧬 <b>Оригинальное</b> - Скачаем через сторонний сервис и отправим файлом с оригинальным качеством',
         reply_markup=_quality_keyboard(request_id),
         parse_mode='HTML',
     )
