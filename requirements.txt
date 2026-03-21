@@ -4,3 +4,4 @@ python-dotenv==1.0.1
 shazamio
 aiosqlite==0.21.0
 cloudscraper==1.2.71
+Babel==2.17.0

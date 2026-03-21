@@ -1,8 +1,10 @@
 import glob
 import json
 import os
+import re
 import subprocess
 import time
+import urllib.request
 import uuid
 
 from yt_dlp import YoutubeDL
@@ -67,6 +69,75 @@ class TikTokDownloader:
         if os.path.exists(self.cookie_file) and os.path.getsize(self.cookie_file) > 0:
             ydl_opts['cookiefile'] = self.cookie_file
 
+    def _clean_country_value(self, value) -> str:
+        if value is None:
+            return ''
+
+        text = str(value).strip()
+        if not text:
+            return ''
+        if text.lower() in {'unknown', 'none', 'null', 'n/a'}:
+            return ''
+
+        if len(text) == 2 and text.isalpha():
+            return text.upper()
+
+        return text
+
+    def _extract_country_from_webpage(self, page_url: str) -> str:
+        if not page_url:
+            return ''
+
+        try:
+            request = urllib.request.Request(
+                page_url,
+                headers={
+                    'User-Agent': (
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) '
+                        'Chrome/121.0.0.0 Safari/537.36'
+                    ),
+                    'Accept-Language': 'en-US,en;q=0.9',
+                },
+            )
+
+            html = urllib.request.urlopen(request, timeout=20).read().decode('utf-8', 'ignore')
+
+            patterns = (
+                r'"locationCreated"\s*:\s*"([A-Z]{2})"',
+                r'"location_created"\s*:\s*"([A-Z]{2})"',
+                r'"createAddress"\s*:\s*"([A-Z]{2})"',
+                r'"create_address"\s*:\s*"([A-Z]{2})"',
+            )
+
+            for pattern in patterns:
+                match = re.search(pattern, html)
+                if match:
+                    return self._clean_country_value(match.group(1))
+
+            return ''
+        except Exception:
+            return ''
+
+    def _extract_country(self, info: dict, source_url: str = '') -> str:
+        direct_fields = (
+            'locationCreated',
+            'location_created',
+            'createAddress',
+            'create_address',
+            'location',
+            'country',
+            'country_code',
+        )
+
+        for field in direct_fields:
+            value = self._clean_country_value(info.get(field))
+            if value:
+                return value
+
+        page_url = info.get('webpage_url') or source_url
+        return self._extract_country_from_webpage(page_url)
+
     def _get_local_video_info(self, file_path: str) -> dict:
         try:
             cmd = [
@@ -117,12 +188,7 @@ class TikTokDownloader:
             with YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
 
-            country = (
-                info.get('location')
-                or info.get('region')
-                or info.get('compat_region')
-                or info.get('geo_bypass_country')
-            )
+            country = self._extract_country(info, url)
 
             return {
                 'status': 'success',
@@ -175,12 +241,7 @@ class TikTokDownloader:
                 download_time = time.time() - start_time
                 file_size = os.path.getsize(file_path)
 
-                country = (
-                    info.get('location')
-                    or info.get('region')
-                    or info.get('compat_region')
-                    or info.get('geo_bypass_country')
-                )
+                country = self._extract_country(info, url)
 
                 local_info = self._get_local_video_info(file_path)
 

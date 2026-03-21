@@ -1,5 +1,7 @@
+import asyncio
 import datetime
 import html
+import logging
 import os
 import re
 import time
@@ -9,10 +11,16 @@ from aiogram import F, Router, types
 from aiogram.filters import CommandStart
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
+try:
+    from babel import Locale
+except Exception:
+    Locale = None
+
 from core.config import MAX_FILE_SIZE_BYTES
 from core.database import cleanup_old_cache, get_cached_video, save_video_cache
 from services.audio import ShazamService
 from services.downloader import TikTokDownloader
+from services.musicaldown import MusicalDownService
 from services.snaptik import SnapTikService
 
 router = Router()
@@ -20,6 +28,7 @@ router = Router()
 downloader = TikTokDownloader()
 shazam_service = ShazamService()
 snaptik_service = SnapTikService()
+musicaldown_service = MusicalDownService()
 
 URL_PATTERN = r'(https?://(?:www\.|vm\.|vt\.)?tiktok\.com/[^\s]+)'
 
@@ -35,6 +44,53 @@ QUALITY_LABELS = {
 
 REQUEST_TTL_SECONDS = 10 * 60
 pending_requests: dict[str, dict] = {}
+logger = logging.getLogger(__name__)
+PREMIUM_RENDER_ATTEMPTS = 3
+PREMIUM_RETRY_STEP_SECONDS = 0.35
+
+RU_LOCALE = Locale.parse('ru') if Locale else None
+
+CUSTOM_EMOJI = {
+    'user': ('5904630315946611415', '👤'),
+    'info': ('6028435952299413210', 'ℹ️'),
+    'likes': ('5116368680279606270', '♥️'),
+    'comments': ('5886436057091673541', '💬'),
+    'reposts': ('6005843436479975944', '🔁'),
+    'file': ('5877680341057015789', '📁'),
+    'date': ('5967412305338568701', '📅'),
+    'region': ('5985479497586053461', '🗺️'),
+    'song': ('5282852032263233269', '🎵'),
+    'via': ('5877465816030515018', '🔗'),
+    'speed': ('5116093437300442328', '⚡'),
+    'speed_song': ('5271627010681108586', '🎵'),
+}
+
+TG_EMOJI_TAG_RE = re.compile(r'<tg-emoji\s+emoji-id="[^"]+">([^<]*)</tg-emoji>')
+USERNAME_RE = re.compile(r'^[A-Za-z0-9_]{5,32}$')
+
+
+def custom_emoji(name: str) -> str:
+    emoji_id, fallback = CUSTOM_EMOJI[name]
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
+
+def strip_custom_emoji_tags(text: str) -> str:
+    return TG_EMOJI_TAG_RE.sub(r'\1', text)
+
+
+def format_requester_label(requester: str) -> str:
+    raw = str(requester or '').strip()
+    if not raw:
+        return '@owner'
+
+    if raw.startswith('@'):
+        raw = raw[1:].strip()
+
+    escaped = html.escape(raw)
+    if USERNAME_RE.fullmatch(raw):
+        return f'@{escaped}'
+
+    return escaped
 
 def _cleanup_pending_requests() -> None:
     now = time.time()
@@ -58,16 +114,19 @@ def _quality_keyboard(request_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text='📉 Обычное',
                     callback_data=f'qsel:{request_id}:{QUALITY_NORMAL}',
+                    style='primary',
                 ),
                 InlineKeyboardButton(
                     text='⚡ Высокое',
                     callback_data=f'qsel:{request_id}:{QUALITY_HIGH}',
+                    style='success',
                 ),
             ],
             [
                 InlineKeyboardButton(
                     text='🧬 Оригинальное',
                     callback_data=f'qsel:{request_id}:{QUALITY_ORIGINAL}',
+                    style='danger',
                 ),
             ],
         ]
@@ -92,6 +151,45 @@ def format_date(date_str):
         return date_obj.strftime('%d.%m.%Y')
     except Exception:
         return datetime.datetime.now().strftime('%d.%m.%Y')
+
+
+def country_flag_emoji(country_code: str) -> str:
+    code = (country_code or '').strip().upper()
+    if len(code) != 2 or not code.isalpha():
+        return ''
+    return ''.join(chr(127397 + ord(char)) for char in code)
+
+
+def country_name_ru(country_code: str) -> str:
+    code = (country_code or '').strip().upper()
+    if len(code) != 2 or not code.isalpha():
+        return country_code
+
+    if RU_LOCALE:
+        try:
+            localized = RU_LOCALE.territories.get(code)
+            if localized:
+                return localized
+        except Exception:
+            pass
+
+    return code
+
+
+def format_region(country_value) -> str:
+    raw = str(country_value or '').strip()
+    if raw.lower() in {'', 'unknown', 'none', 'null', 'n/a'}:
+        return ''
+
+    code = raw.upper()
+    if len(code) == 2 and code.isalpha():
+        flag = country_flag_emoji(code)
+        name = country_name_ru(code)
+        if flag:
+            return f'{flag} {name}'
+        return name
+
+    return raw
 
 
 def normalize_duration_seconds(value) -> float:
@@ -140,6 +238,10 @@ def merge_probe_metadata(info: dict, probe_data: dict | None) -> dict:
             if not is_missing(probe_value):
                 info[field] = probe_value
 
+    probe_country = probe_data.get('detected_country')
+    if not is_missing(probe_country):
+        info['detected_country'] = probe_country
+
     if not info.get('description') and probe_data.get('title'):
         info['description'] = probe_data['title']
 
@@ -166,6 +268,8 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
     uploader_id = html.escape(raw_uploader_id)
 
     description = html.escape(info.get('description', '') or '')
+    if not description:
+        description = 'Без описания'
     if len(description) > 150:
         description = description[:147] + '...'
 
@@ -173,38 +277,42 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
     comments = format_number(info.get('comment_count', 0))
     reposts = format_number(info.get('repost_count', 0))
     upload_date = format_date(info.get('upload_date'))
-    country_code = info.get('detected_country')
+    region_text = format_region(info.get('detected_country'))
     file_size_mb = info.get('file_size', 0) / (1024 * 1024)
     duration = int(normalize_duration_seconds(info.get('duration', 0)))
-    width = info.get('width', 0)
-    height = info.get('height', 0)
-    fps = info.get('fps', 0)
+    width = int(info.get('width', 0) or 0)
+    height = int(info.get('height', 0) or 0)
+    fps = int(info.get('fps', 0) or 0)
     song_name = html.escape(str(info.get('song_name', 'Original Sound')))
     quality_label = html.escape(info.get('quality_label', QUALITY_LABELS[QUALITY_HIGH]))
+    requester_label = format_requester_label(requester)
 
-    location_line = f'📅 {upload_date}'
-    if country_code and country_code != 'Unknown':
-        location_line += f'  🌍 {country_code}'
+    location_line = f'{custom_emoji("date")} {upload_date}'
+    if region_text:
+        location_line += f'\n{custom_emoji("region")} Регион: {html.escape(region_text)}'
 
     cached_mark = ' ♻️' if info.get('cached') else ''
-    fps_text = f'{fps}fps | ' if fps and fps > 0 else 'N/A | '
+    fps_text = f'{fps}fps' if fps and fps > 0 else 'N/A'
 
     uploader_suffix = ''
     if uploader_id and uploader_id != uploader_name:
         uploader_suffix = f' (@{uploader_id})'
 
     return (
-        f'👤 <b>{uploader_name}</b>{uploader_suffix}{cached_mark}\n\n'
-        f'📝 <blockquote expandable>{description}</blockquote>\n\n'
-        f'❤️ {likes}  💬 {comments}  🔄 {reposts}\n\n'
+        f'{custom_emoji("user")} <b>{uploader_name}</b>{uploader_suffix}{cached_mark}\n\n'
+        f'{custom_emoji("info")} \n'
+        f'<blockquote>{description}</blockquote>\n\n'
+        f'{custom_emoji("likes")} {likes}  '
+        f'{custom_emoji("comments")} {comments}  '
+        f'{custom_emoji("reposts")} {reposts}\n\n'
         f'🎚️ <b>{quality_label}</b>\n'
-        f'💾 <code>{duration}s | {width}×{height} | {fps_text}{file_size_mb:.1f}MB</code>\n'
+        f'{custom_emoji("file")} {duration}s | {width}×{height} | {fps_text} | {file_size_mb:.1f}MB\n'
         f'{location_line}\n\n'
-        f'🎵 <i>{song_name}</i>\n\n'
-        f'🔗 via @{requester}\n\n'
-        f'⚡ <code>↓{times.get("download", 0):.1f}s</code> | '
-        f'<code>↑{times.get("upload", 0):.1f}s</code> | '
-        f'<code>🎵{times.get("recognize", 0):.1f}s</code> | '
+        f'{custom_emoji("song")} <i>{song_name}</i>\n\n'
+        f'{custom_emoji("via")} via {requester_label}\n\n'
+        f'{custom_emoji("speed")} ↓{times.get("download", 0):.1f}s | '
+        f'↑{times.get("upload", 0):.1f}s | '
+        f'{custom_emoji("speed_song")} {times.get("recognize", 0):.1f}s | '
         f'<b>Σ{times.get("total", 0):.1f}s</b>'
     )
 
@@ -235,6 +343,91 @@ async def _send_media(
     )
 
 
+async def _send_media_with_premium_retry(
+    target: types.Message,
+    quality: str,
+    media,
+    caption: str,
+    width: int = 0,
+    height: int = 0,
+    duration: int = 0,
+) -> types.Message:
+    fallback_caption = strip_custom_emoji_tags(caption)
+    last_error = None
+
+    for attempt in range(1, PREMIUM_RENDER_ATTEMPTS + 1):
+        try:
+            return await _send_media(
+                target=target,
+                quality=quality,
+                media=media,
+                caption=caption,
+                width=width,
+                height=height,
+                duration=duration,
+            )
+        except Exception as exc:
+            last_error = exc
+            if attempt < PREMIUM_RENDER_ATTEMPTS:
+                await asyncio.sleep(PREMIUM_RETRY_STEP_SECONDS * attempt)
+
+    logger.warning(
+        'Premium caption send failed after %s attempts, using fallback: %s',
+        PREMIUM_RENDER_ATTEMPTS,
+        last_error,
+    )
+    return await _send_media(
+        target=target,
+        quality=quality,
+        media=media,
+        caption=fallback_caption,
+        width=width,
+        height=height,
+        duration=duration,
+    )
+
+
+async def _edit_caption_with_premium_retry(message: types.Message, caption: str) -> None:
+    fallback_caption = strip_custom_emoji_tags(caption)
+    last_error = None
+
+    for attempt in range(1, PREMIUM_RENDER_ATTEMPTS + 1):
+        try:
+            await message.edit_caption(caption=caption, parse_mode='HTML')
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt < PREMIUM_RENDER_ATTEMPTS:
+                await asyncio.sleep(PREMIUM_RETRY_STEP_SECONDS * attempt)
+
+    logger.warning(
+        'Premium caption edit failed after %s attempts, using fallback: %s',
+        PREMIUM_RENDER_ATTEMPTS,
+        last_error,
+    )
+    await message.edit_caption(caption=fallback_caption, parse_mode='HTML')
+
+
+async def _download_through_external_services(url: str) -> tuple[dict | None, list[str]]:
+    providers = (
+        ('SnapTik', snaptik_service),
+        ('MusicalDown', musicaldown_service),
+    )
+    errors: list[str] = []
+
+    for provider_name, provider_service in providers:
+        result = await provider_service.download_original(url, MAX_FILE_SIZE_BYTES)
+        if result.get('status') == 'success':
+            result['external_provider'] = provider_name
+            return result, errors
+
+        provider_message = result.get('message', 'Unknown error')
+        errors.append(f'{provider_name}: {provider_message}')
+        logger.warning('%s download failed: %s', provider_name, provider_message)
+
+    return None, errors
+
+
 async def _process_download(
     target_message: types.Message,
     status_message: types.Message,
@@ -253,6 +446,7 @@ async def _process_download(
 
         cached['cached'] = True
         cached['quality_label'] = QUALITY_LABELS.get(quality, QUALITY_LABELS[QUALITY_HIGH])
+        cached = merge_probe_metadata(cached, probe_data)
 
         times = {
             'download': 0,
@@ -264,7 +458,7 @@ async def _process_download(
         caption = build_caption(cached, requester, times)
 
         try:
-            await _send_media(
+            await _send_media_with_premium_retry(
                 target=target_message,
                 quality=quality,
                 media=cached['file_id'],
@@ -282,10 +476,30 @@ async def _process_download(
     try:
         if quality in {QUALITY_HIGH, QUALITY_ORIGINAL}:
             if quality == QUALITY_ORIGINAL:
-                await status_message.edit_text('🧬 <b>Ищу оригинальное качество через сторонний сервис...</b>', parse_mode='HTML')
+                await status_message.edit_text('🧬 <b>Ищу оригинальное качество через сторонние сервисы...</b>', parse_mode='HTML')
             else:
-                await status_message.edit_text('⚡ <b>Ищу высокое качество через сторонний сервис...</b>', parse_mode='HTML')
-            info = await snaptik_service.download_original(url, MAX_FILE_SIZE_BYTES)
+                await status_message.edit_text('⚡ <b>Ищу высокое качество через сторонние сервисы...</b>', parse_mode='HTML')
+
+            info, external_errors = await _download_through_external_services(url)
+
+            if info is None:
+                await status_message.edit_text(
+                    '⏳ <b>Сторонние сервисы недоступны, пробую прямую загрузку через TikTok...</b>',
+                    parse_mode='HTML',
+                )
+
+                fallback_info = await downloader.download_video(url, quality=quality)
+                if fallback_info.get('status') == 'error':
+                    external_details = '\n'.join(f'- {item}' for item in external_errors) or '- Unknown error'
+                    info = {
+                        'status': 'error',
+                        'message': (
+                            f'Сторонние сервисы:\n{external_details}\n'
+                            f'Прямая загрузка: {fallback_info.get("message", "Unknown error")}'
+                        ),
+                    }
+                else:
+                    info = fallback_info
         else:
             await status_message.edit_text('⏳ <b>Скачиваю видео с TikTok...</b>', parse_mode='HTML')
             info = await downloader.download_video(url, quality=quality)
@@ -369,7 +583,7 @@ async def _process_download(
 
         final_caption = build_caption(info, requester, times)
 
-        await sent_message.edit_caption(caption=final_caption, parse_mode='HTML')
+        await _edit_caption_with_premium_retry(sent_message, final_caption)
 
         file_id = None
         if quality == QUALITY_ORIGINAL:
@@ -426,11 +640,18 @@ async def handle_tiktok_link(message: types.Message):
     if probe.get('status') == 'error':
         snaptik_probe = await snaptik_service.probe_video(url)
         if snaptik_probe.get('status') == 'error':
-            await status_msg.edit_text(
-                f'❌ <b>Видео недоступно:</b>\n<code>{html.escape(probe.get("message", "Unknown error"))}</code>',
-                parse_mode='HTML',
-            )
-            return
+            musicaldown_probe = await musicaldown_service.probe_video(url)
+            if musicaldown_probe.get('status') == 'error':
+                external_message = snaptik_probe.get('message') or musicaldown_probe.get('message')
+                details = probe.get('message', 'Unknown error')
+                if external_message:
+                    details = f'{details}\nСторонний сервис: {external_message}'
+
+                await status_msg.edit_text(
+                    f'❌ <b>Видео недоступно:</b>\n<code>{html.escape(details)}</code>',
+                    parse_mode='HTML',
+                )
+                return
 
         probe = {
             'status': 'success',

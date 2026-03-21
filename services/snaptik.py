@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import time
@@ -69,6 +70,75 @@ class SnapTikService:
             )
 
         return candidates
+
+    def _extract_video_candidates_from_text(self, raw_text: str) -> list[dict]:
+        candidates = self._extract_video_candidates(raw_text or '')
+        if candidates:
+            return candidates
+
+        text = raw_text or ''
+        if not text:
+            return []
+
+        url_pattern = re.compile(r'https?://[^\s"\'<>]+', re.IGNORECASE)
+        seen = set()
+        fallback_candidates = []
+
+        for match in url_pattern.finditer(text):
+            url = match.group(0).strip()
+            lower_url = url.lower()
+
+            if 'snaptikpro.net' in lower_url:
+                continue
+            if lower_url.startswith('https://snaptik.net/'):
+                continue
+
+            if '.mp3' in lower_url:
+                continue
+
+            if '.mp4' not in lower_url and 'dl.snapcdn.app/get?' not in lower_url:
+                continue
+
+            if url in seen:
+                continue
+
+            seen.add(url)
+            fallback_candidates.append(
+                {
+                    'url': url,
+                    'text': 'direct_link',
+                    'is_hd': 'hd' in lower_url,
+                }
+            )
+
+        return fallback_candidates
+
+    def _parse_json_payload(self, raw_text: str):
+        text = (raw_text or '').strip()
+        if not text:
+            return None
+
+        candidates = [text]
+
+        if text.startswith(")]}'"):
+            lines = text.splitlines()
+            if len(lines) > 1:
+                candidates.append('\n'.join(lines[1:]).strip())
+
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            candidates.append(text[start : end + 1])
+
+        for payload_text in candidates:
+            if not payload_text:
+                continue
+            try:
+                return json.loads(payload_text)
+            except Exception:
+                continue
+
+        return None
 
     def _extract_size(self, headers) -> int:
         content_range = headers.get('Content-Range', '')
@@ -218,24 +288,64 @@ class SnapTikService:
                 headers=headers,
                 timeout=90,
             )
-            payload = response.json()
         except Exception as e:
             return {
                 'status': 'error',
                 'message': f'Запрос к стороннему сервису не выполнен: {e}',
             }
 
-        if payload.get('status') != 'ok':
+        if response.status_code >= 400:
             return {
                 'status': 'error',
-                'message': payload.get('msg') or 'Сторонний сервис не подтвердил успешный поиск',
+                'message': f'Сторонний сервис вернул HTTP {response.status_code}',
             }
 
-        candidates = self._extract_video_candidates(payload.get('data', ''))
+        raw_body = response.text or ''
+
+        payload = None
+        try:
+            payload = response.json()
+        except Exception:
+            payload = self._parse_json_payload(raw_body)
+
+        candidates = []
+        service_message = ''
+
+        if isinstance(payload, dict):
+            raw_status = payload.get('status')
+            status_ok = raw_status is True or str(raw_status).strip().lower() in {'ok', 'success', 'true', '1'}
+            service_message = str(payload.get('msg') or payload.get('message') or '')
+
+            fragments = []
+            data_field = payload.get('data')
+
+            if isinstance(data_field, str):
+                fragments.append(data_field)
+            elif isinstance(data_field, dict):
+                fragments.extend(value for value in data_field.values() if isinstance(value, str))
+
+            for key in ('html', 'result', 'download'):
+                value = payload.get(key)
+                if isinstance(value, str):
+                    fragments.append(value)
+
+            for fragment in fragments:
+                candidates.extend(self._extract_video_candidates_from_text(fragment))
+
+            if not candidates and not status_ok and service_message:
+                return {
+                    'status': 'error',
+                    'message': service_message,
+                }
+
         if not candidates:
+            candidates = self._extract_video_candidates_from_text(raw_body)
+
+        if not candidates:
+            fallback_message = service_message or 'Сторонний сервис не вернул ссылку на MP4'
             return {
                 'status': 'error',
-                'message': 'Сторонний сервис не вернул ссылку на MP4',
+                'message': fallback_message,
             }
 
         return {
