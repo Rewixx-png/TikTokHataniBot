@@ -409,6 +409,7 @@ class SnapTikService:
             'uploader_id': '',
             'description': '',
             'like_count': 0,
+            'view_count': 0,
             'comment_count': 0,
             'repost_count': 0,
             'upload_date': None,

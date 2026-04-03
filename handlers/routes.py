@@ -17,7 +17,7 @@ except Exception:
     Locale = None
 
 from core.config import MAX_FILE_SIZE_BYTES
-from core.database import cleanup_old_cache, get_cached_video, save_video_cache
+from core.database import cleanup_old_cache, get_cached_video, get_cached_video_by_file_id, save_video_cache
 from services.audio import ShazamService
 from services.downloader import TikTokDownloader
 from services.musicaldown import MusicalDownService
@@ -47,6 +47,7 @@ pending_requests: dict[str, dict] = {}
 logger = logging.getLogger(__name__)
 PREMIUM_RENDER_ATTEMPTS = 3
 PREMIUM_RETRY_STEP_SECONDS = 0.35
+REFRESH_META_CALLBACK = 'meta:update'
 
 RU_LOCALE = Locale.parse('ru') if Locale else None
 
@@ -54,6 +55,7 @@ CUSTOM_EMOJI = {
     'user': ('5904630315946611415', '👤'),
     'info': ('6028435952299413210', 'ℹ️'),
     'likes': ('5116368680279606270', '♥️'),
+    'views': ('6037397706505195857', '👁'),
     'comments': ('5886436057091673541', '💬'),
     'reposts': ('6005843436479975944', '🔁'),
     'file': ('5877680341057015789', '📁'),
@@ -131,6 +133,95 @@ def _quality_keyboard(request_id: str) -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def _metadata_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text='🔄 Обновить данные TT',
+                    callback_data=REFRESH_META_CALLBACK,
+                )
+            ]
+        ]
+    )
+
+
+def _split_cache_key(cache_key: str) -> tuple[str, str]:
+    raw = str(cache_key or '')
+    if '|' not in raw:
+        if raw.startswith('http://') or raw.startswith('https://'):
+            return QUALITY_HIGH, raw
+        return QUALITY_HIGH, ''
+
+    quality, source_url = raw.split('|', 1)
+    if quality not in QUALITY_LABELS:
+        quality = QUALITY_HIGH
+
+    return quality, source_url
+
+
+def _extract_times_from_caption(caption: str | None) -> dict:
+    default_times = {
+        'download': 0.0,
+        'upload': 0.0,
+        'recognize': 0.0,
+        'total': 0.0,
+    }
+
+    if not caption:
+        return default_times
+
+    text = strip_custom_emoji_tags(caption)
+    text = re.sub(r'<[^>]+>', '', text)
+
+    line_with_total = ''
+    for line in text.splitlines():
+        if 'Σ' in line and 's' in line:
+            line_with_total = line
+            break
+
+    if not line_with_total:
+        return default_times
+
+    matches = re.findall(r'([0-9]+(?:\.[0-9]+)?)s', line_with_total)
+    if len(matches) < 4:
+        return default_times
+
+    try:
+        return {
+            'download': float(matches[0]),
+            'upload': float(matches[1]),
+            'recognize': float(matches[2]),
+            'total': float(matches[3]),
+        }
+    except (TypeError, ValueError):
+        return default_times
+
+
+def _refresh_info_from_probe(cached_info: dict, probe_data: dict) -> dict:
+    info = dict(cached_info)
+
+    if not probe_data or probe_data.get('status') != 'success':
+        return info
+
+    for field in ('like_count', 'view_count', 'comment_count', 'repost_count'):
+        value = probe_data.get(field)
+        if value is None:
+            continue
+
+        try:
+            numeric_value = int(float(value))
+        except (TypeError, ValueError):
+            continue
+
+        if numeric_value < 0:
+            continue
+
+        info[field] = numeric_value
+
+    return info
 
 
 def format_number(num):
@@ -221,6 +312,7 @@ def merge_probe_metadata(info: dict, probe_data: dict | None) -> dict:
         'uploader_id',
         'description',
         'like_count',
+        'view_count',
         'comment_count',
         'repost_count',
         'upload_date',
@@ -274,6 +366,7 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
         description = description[:147] + '...'
 
     likes = format_number(info.get('like_count', 0))
+    views = format_number(info.get('view_count', 0))
     comments = format_number(info.get('comment_count', 0))
     reposts = format_number(info.get('repost_count', 0))
     upload_date = format_date(info.get('upload_date'))
@@ -303,6 +396,7 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
         f'{custom_emoji("info")} \n'
         f'<blockquote>{description}</blockquote>\n\n'
         f'{custom_emoji("likes")} {likes}  '
+        f'{custom_emoji("views")} {views}  '
         f'{custom_emoji("comments")} {comments}  '
         f'{custom_emoji("reposts")} {reposts}\n\n'
         f'🎚️ <b>{quality_label}</b>\n'
@@ -325,12 +419,14 @@ async def _send_media(
     width: int = 0,
     height: int = 0,
     duration: int = 0,
+    reply_markup: InlineKeyboardMarkup | None = None,
 ) -> types.Message:
     if quality == QUALITY_ORIGINAL:
         return await target.answer_document(
             document=media,
             caption=caption,
             parse_mode='HTML',
+            reply_markup=reply_markup,
         )
 
     return await target.answer_video(
@@ -340,6 +436,7 @@ async def _send_media(
         width=width,
         height=height,
         duration=duration,
+        reply_markup=reply_markup,
     )
 
 
@@ -351,6 +448,7 @@ async def _send_media_with_premium_retry(
     width: int = 0,
     height: int = 0,
     duration: int = 0,
+    reply_markup: InlineKeyboardMarkup | None = None,
 ) -> types.Message:
     fallback_caption = strip_custom_emoji_tags(caption)
     last_error = None
@@ -365,6 +463,7 @@ async def _send_media_with_premium_retry(
                 width=width,
                 height=height,
                 duration=duration,
+                reply_markup=reply_markup,
             )
         except Exception as exc:
             last_error = exc
@@ -384,16 +483,21 @@ async def _send_media_with_premium_retry(
         width=width,
         height=height,
         duration=duration,
+        reply_markup=reply_markup,
     )
 
 
-async def _edit_caption_with_premium_retry(message: types.Message, caption: str) -> None:
+async def _edit_caption_with_premium_retry(
+    message: types.Message,
+    caption: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
     fallback_caption = strip_custom_emoji_tags(caption)
     last_error = None
 
     for attempt in range(1, PREMIUM_RENDER_ATTEMPTS + 1):
         try:
-            await message.edit_caption(caption=caption, parse_mode='HTML')
+            await message.edit_caption(caption=caption, parse_mode='HTML', reply_markup=reply_markup)
             return
         except Exception as exc:
             last_error = exc
@@ -405,7 +509,7 @@ async def _edit_caption_with_premium_retry(message: types.Message, caption: str)
         PREMIUM_RENDER_ATTEMPTS,
         last_error,
     )
-    await message.edit_caption(caption=fallback_caption, parse_mode='HTML')
+    await message.edit_caption(caption=fallback_caption, parse_mode='HTML', reply_markup=reply_markup)
 
 
 async def _download_through_external_services(url: str) -> tuple[dict | None, list[str]]:
@@ -466,6 +570,7 @@ async def _process_download(
                 width=cached.get('width', 0),
                 height=cached.get('height', 0),
                 duration=int(cached.get('duration', 0)),
+                reply_markup=_metadata_keyboard(),
             )
             await status_message.delete()
             await cleanup_old_cache()
@@ -583,7 +688,7 @@ async def _process_download(
 
         final_caption = build_caption(info, requester, times)
 
-        await _edit_caption_with_premium_retry(sent_message, final_caption)
+        await _edit_caption_with_premium_retry(sent_message, final_caption, reply_markup=_metadata_keyboard())
 
         file_id = None
         if quality == QUALITY_ORIGINAL:
@@ -661,6 +766,7 @@ async def handle_tiktok_link(message: types.Message):
             'uploader_id': '',
             'description': '',
             'like_count': 0,
+            'view_count': 0,
             'comment_count': 0,
             'repost_count': 0,
             'upload_date': None,
@@ -690,6 +796,61 @@ async def handle_tiktok_link(message: types.Message):
         reply_markup=_quality_keyboard(request_id),
         parse_mode='HTML',
     )
+
+
+@router.callback_query(F.data == REFRESH_META_CALLBACK)
+async def handle_refresh_metadata(callback: types.CallbackQuery):
+    message = callback.message
+    if not message:
+        await callback.answer('Сообщение не найдено', show_alert=True)
+        return
+
+    file_id = ''
+    if message.video and message.video.file_id:
+        file_id = message.video.file_id
+    elif message.document and message.document.file_id:
+        file_id = message.document.file_id
+
+    if not file_id:
+        await callback.answer('Не удалось определить файл сообщения', show_alert=True)
+        return
+
+    cached = await get_cached_video_by_file_id(file_id)
+    if not cached:
+        await callback.answer('Кэш не найден, отправь ссылку заново', show_alert=True)
+        return
+
+    cache_key = str(cached.get('url') or '')
+    quality, source_url = _split_cache_key(cache_key)
+    if not source_url:
+        await callback.answer('Источник видео не найден', show_alert=True)
+        return
+
+    await callback.answer('Обновляю данные TikTok...')
+
+    probe = await downloader.probe_video(source_url)
+    if probe.get('status') == 'error':
+        await callback.answer('Не удалось обновить данные TikTok', show_alert=True)
+        return
+
+    refreshed = _refresh_info_from_probe(cached, probe)
+    refreshed['cached'] = True
+    refreshed['quality_label'] = QUALITY_LABELS.get(quality, QUALITY_LABELS[QUALITY_HIGH])
+    refreshed['file_id'] = file_id
+    refreshed['url'] = cache_key
+
+    requester = callback.from_user.username or callback.from_user.first_name or 'owner'
+    times = _extract_times_from_caption(message.caption or '')
+    new_caption = build_caption(refreshed, requester, times)
+
+    try:
+        await _edit_caption_with_premium_retry(message, new_caption, reply_markup=_metadata_keyboard())
+    except Exception:
+        await callback.answer('Не удалось обновить сообщение', show_alert=True)
+        return
+
+    await save_video_cache(refreshed)
+    await callback.answer('Данные TikTok обновлены ✅')
 
 
 @router.callback_query(F.data.startswith('qsel:'))
