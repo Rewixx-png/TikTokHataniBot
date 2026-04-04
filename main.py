@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import sys
 
@@ -15,6 +16,7 @@ from core.config import (
 )
 from core.database import init_db
 from handlers.routes import router
+from services.profile_watcher import TikTokProfileWatcher
 
 
 async def main():
@@ -41,12 +43,19 @@ async def main():
 
     bot = Bot(**bot_kwargs)
     dp = Dispatcher()
+    profile_watcher = TikTokProfileWatcher()
+    watcher_task = None
 
     dp.include_router(router)
 
     try:
+        watcher_task = asyncio.create_task(profile_watcher.run(bot))
         await dp.start_polling(bot)
     finally:
+        if watcher_task:
+            watcher_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watcher_task
         await bot.session.close()
 
 

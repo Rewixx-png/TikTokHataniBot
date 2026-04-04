@@ -31,6 +31,7 @@
 - 🎚️ **Quality Picker** — Choose `Normal`, `High`, or `Original` quality before download
 - 🧬 **Original/High Source** — `High` and `Original` use a third-party source; `Original` is sent as file
 - 🎵 **Audio Recognition** — Shazam integration for track identification
+- 🔔 **Profile Watcher** — Optional alerts in configured chat/topic when watched TikTok profile posts a new video
 - 💾 **Smart Caching** — SQLite-based cache with 7-day TTL prevents re-downloading same videos
 - 📊 **Rich Metadata** — Likes, comments, reposts, resolution, FPS, file size, upload date
 - 🌍 **Geolocation** — Detects country of upload when available
@@ -108,8 +109,14 @@ Bot uses SQLite with following logic:
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `BOT_TOKEN` | Telegram Bot Token from [@BotFather](https://t.me/botfather) | Yes |
+| `BOT_OWNER_ID` | Telegram user ID allowed to run `/test` watcher command in private chat | No |
 | `DOWNLOAD_DIR` | Download directory (default: `./downloads`) | No |
 | `MAX_FILE_SIZE_MB` | Max upload size in MB (auto defaults to 50 or 2000 in local Bot API mode) | No |
+| `TIKTOK_WATCH_ENABLED` | Enables watched-profile notifications | No |
+| `TIKTOK_WATCH_PROFILE_URL` | TikTok profile URL to monitor for new videos | No |
+| `TIKTOK_WATCH_POLL_SECONDS` | Poll interval in seconds (minimum 30) | No |
+| `TIKTOK_WATCH_TARGET_CHAT_ID` | Target chat ID for watcher alerts (supports supergroup numeric id) | No |
+| `TIKTOK_WATCH_TARGET_THREAD_ID` | Optional forum topic `message_thread_id` (`0` for General topic) | No |
 | `TELEGRAM_API_ID` | Telegram API ID for local Bot API container | For Docker local Bot API |
 | `TELEGRAM_API_HASH` | Telegram API hash for local Bot API container | For Docker local Bot API |
 | `TELEGRAM_BOT_API_BASE_URL` | Custom Bot API base URL (e.g. `http://127.0.0.1:18081`) | No |
@@ -127,6 +134,7 @@ Bot uses SQLite with following logic:
 ├── services/
 │   ├── audio.py       # Shazam recognition
 │   ├── downloader.py  # TikTok downloader (normal + metadata probe)
+│   ├── profile_watcher.py # Owner alerts for new videos on watched profile
 │   ├── snaptik.py     # Third-party download flow (high/original)
 │   └── __init__.py
 ├── downloads/         # Temporary download directory

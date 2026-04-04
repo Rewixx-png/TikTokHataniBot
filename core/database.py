@@ -32,6 +32,14 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_created_at ON video_cache(created_at)
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS app_state (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         cursor = await db.execute("PRAGMA table_info(video_cache)")
         columns = [row[1] for row in await cursor.fetchall()]
         if 'view_count' not in columns:
@@ -109,5 +117,33 @@ async def cleanup_old_cache():
         await db.execute(
             "DELETE FROM video_cache WHERE created_at < ?",
             (datetime.now() - timedelta(days=7),)
+        )
+        await db.commit()
+
+
+async def get_app_state(key: str):
+    if not key:
+        return None
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT value FROM app_state WHERE key = ?",
+            (key,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def set_app_state(key: str, value: str):
+    if not key:
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO app_state (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            """,
+            (key, value),
         )
         await db.commit()

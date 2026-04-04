@@ -8,7 +8,7 @@ import time
 import uuid
 
 from aiogram import F, Router, types
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
 try:
@@ -16,11 +16,12 @@ try:
 except Exception:
     Locale = None
 
-from core.config import MAX_FILE_SIZE_BYTES
+from core.config import BOT_OWNER_ID, MAX_FILE_SIZE_BYTES
 from core.database import cleanup_old_cache, get_cached_video, get_cached_video_by_file_id, save_video_cache
 from services.audio import ShazamService
 from services.downloader import TikTokDownloader
 from services.musicaldown import MusicalDownService
+from services.profile_watcher import TikTokProfileWatcher
 from services.snaptik import SnapTikService
 
 router = Router()
@@ -29,6 +30,7 @@ downloader = TikTokDownloader()
 shazam_service = ShazamService()
 snaptik_service = SnapTikService()
 musicaldown_service = MusicalDownService()
+profile_watcher = TikTokProfileWatcher()
 
 URL_PATTERN = r'(https?://(?:www\.|vm\.|vt\.)?tiktok\.com/[^\s]+)'
 
@@ -93,6 +95,17 @@ def format_requester_label(requester: str) -> str:
         return f'@{escaped}'
 
     return escaped
+
+
+def _is_owner_private_message(message: types.Message) -> bool:
+    if not message.from_user:
+        return False
+
+    if int(BOT_OWNER_ID or 0) <= 0:
+        return False
+
+    chat_type = getattr(message.chat.type, 'value', message.chat.type)
+    return str(chat_type).lower() == 'private' and message.from_user.id == BOT_OWNER_ID
 
 def _cleanup_pending_requests() -> None:
     now = time.time()
@@ -198,6 +211,25 @@ def _extract_times_from_caption(caption: str | None) -> dict:
         }
     except (TypeError, ValueError):
         return default_times
+
+
+def _extract_requester_from_caption(caption: str | None) -> str:
+    if not caption:
+        return ''
+
+    text = strip_custom_emoji_tags(caption)
+    text = re.sub(r'<[^>]+>', '', text)
+
+    for line in text.splitlines():
+        match = re.search(r'\bvia\s+(.+)$', line.strip(), flags=re.IGNORECASE)
+        if not match:
+            continue
+
+        requester = match.group(1).strip()
+        if requester:
+            return requester
+
+    return ''
 
 
 def _refresh_info_from_probe(cached_info: dict, probe_data: dict) -> dict:
@@ -730,6 +762,32 @@ async def cmd_start(message: types.Message):
     )
 
 
+@router.message(Command('test'))
+async def cmd_test_profile_watch_notification(message: types.Message):
+    if not _is_owner_private_message(message):
+        await message.reply('⛔ Команда доступна только владельцу бота в ЛС.')
+        return
+
+    if not profile_watcher.profile_url:
+        await message.reply('⚠️ Не задан TIKTOK_WATCH_PROFILE_URL в окружении.')
+        return
+
+    status = await message.reply('🧪 <b>Готовлю тестовое уведомление...</b>', parse_mode='HTML')
+    result = await profile_watcher.send_latest_preview(message.bot)
+
+    if result.get('status') == 'success':
+        await status.edit_text(
+            f'✅ <b>Тестовое уведомление отправлено в чат:</b> <code>{profile_watcher.target_chat_id}</code>',
+            parse_mode='HTML',
+        )
+        return
+
+    await status.edit_text(
+        f'❌ <b>Тест не удался:</b>\n<code>{html.escape(result.get("message", "Unknown error"))}</code>',
+        parse_mode='HTML',
+    )
+
+
 @router.message(F.text.regexp(URL_PATTERN))
 async def handle_tiktok_link(message: types.Message):
     match = re.search(URL_PATTERN, message.text or '')
@@ -839,7 +897,8 @@ async def handle_refresh_metadata(callback: types.CallbackQuery):
     refreshed['file_id'] = file_id
     refreshed['url'] = cache_key
 
-    requester = callback.from_user.username or callback.from_user.first_name or 'owner'
+    original_requester = _extract_requester_from_caption(message.caption or '')
+    requester = original_requester or callback.from_user.username or callback.from_user.first_name or 'owner'
     times = _extract_times_from_caption(message.caption or '')
     new_caption = build_caption(refreshed, requester, times)
 
