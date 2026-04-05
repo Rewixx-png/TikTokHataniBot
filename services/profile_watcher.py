@@ -4,6 +4,7 @@ import html
 import logging
 import os
 import re
+from dataclasses import dataclass
 
 from aiogram import Bot
 from aiogram.types import FSInputFile
@@ -14,7 +15,7 @@ from core.config import (
     BOT_OWNER_ID,
     TIKTOK_WATCH_ENABLED,
     TIKTOK_WATCH_POLL_SECONDS,
-    TIKTOK_WATCH_PROFILE_URL,
+    TIKTOK_WATCH_PROFILES,
     TIKTOK_WATCH_TARGET_CHAT_ID,
     TIKTOK_WATCH_TARGET_THREAD_ID,
 )
@@ -37,17 +38,25 @@ CUSTOM_EMOJI = {
 TG_EMOJI_TAG_RE = re.compile(r'<tg-emoji\s+emoji-id="[^"]+">([^<]*)</tg-emoji>')
 
 
+@dataclass(frozen=True)
+class WatchProfile:
+    key: str
+    url: str
+    label: str
+    username: str
+    state_key: str
+
+
 class TikTokProfileWatcher:
     def __init__(self):
         self.owner_id = BOT_OWNER_ID
         self.target_chat_id = TIKTOK_WATCH_TARGET_CHAT_ID
         self.target_thread_id = TIKTOK_WATCH_TARGET_THREAD_ID
-        self.profile_url = TIKTOK_WATCH_PROFILE_URL
         self.poll_seconds = TIKTOK_WATCH_POLL_SECONDS
-        self.enabled = bool(TIKTOK_WATCH_ENABLED and self.target_chat_id and self.profile_url)
-        self.profile_username = self._extract_username(self.profile_url)
-        state_suffix = self.profile_username or self.profile_url
-        self.state_key = f'tiktok_watch_last_video:{state_suffix}'
+        self.profiles = self._normalize_profiles(TIKTOK_WATCH_PROFILES)
+        self.profile_url = self.profiles[0].url if self.profiles else ''
+        self.profile_username = self.profiles[0].username if self.profiles else ''
+        self.enabled = bool(TIKTOK_WATCH_ENABLED and self.target_chat_id and self.profiles)
         self.cookie_file = os.path.join(os.getcwd(), 'cookies.txt')
         self.downloader = TikTokDownloader()
 
@@ -55,7 +64,64 @@ class TikTokProfileWatcher:
         match = re.search(r'tiktok\.com/@([^/?]+)', profile_url or '', re.IGNORECASE)
         if not match:
             return ''
-        return match.group(1).strip()
+        return match.group(1).strip().lower()
+
+    def _normalize_profiles(self, raw_profiles: list[dict]) -> list[WatchProfile]:
+        normalized: list[WatchProfile] = []
+        for item in raw_profiles or []:
+            url = str((item or {}).get('url') or '').strip()
+            if not url:
+                continue
+
+            username = self._extract_username(url)
+            key = str((item or {}).get('key') or username or url).strip().lower()
+            label = str((item or {}).get('label') or '').strip()
+            state_suffix = key or username or url
+            state_key = f'tiktok_watch_last_video:{state_suffix}'
+
+            normalized.append(
+                WatchProfile(
+                    key=key,
+                    url=url,
+                    label=label,
+                    username=username,
+                    state_key=state_key,
+                )
+            )
+
+        return normalized
+
+    def profile_keys(self) -> list[str]:
+        keys = []
+        for profile in self.profiles:
+            if profile.label:
+                keys.append(profile.label)
+            elif profile.username:
+                keys.append(profile.username)
+            else:
+                keys.append(profile.key)
+        return keys
+
+    def _resolve_profile(self, profile_key: str | None) -> WatchProfile | None:
+        if not self.profiles:
+            return None
+
+        if not profile_key:
+            return self.profiles[0]
+
+        normalized_key = str(profile_key).strip().lower()
+        if normalized_key.startswith('@'):
+            normalized_key = normalized_key[1:]
+
+        for profile in self.profiles:
+            if normalized_key in {
+                profile.key,
+                profile.username,
+                profile.label.strip().lower(),
+            }:
+                return profile
+
+        return None
 
     def _ydl_opts(self) -> dict:
         options = {
@@ -133,12 +199,13 @@ class TikTokProfileWatcher:
             return duration / 1000
         return duration
 
-    def _build_caption(self, latest: dict, info: dict) -> str:
-        profile_url = html.escape(self.profile_url, quote=True)
+    def _build_caption(self, latest: dict, info: dict, profile: WatchProfile) -> str:
+        profile_url = html.escape(profile.url, quote=True)
         display_name = (
-            latest.get('channel_name')
+            profile.label
+            or latest.get('channel_name')
             or latest.get('uploader_name')
-            or self.profile_username
+            or profile.username
             or latest.get('uploader_id')
             or 'Автор'
         )
@@ -174,10 +241,10 @@ class TikTokProfileWatcher:
             f'{self._custom_emoji("song")} <i>Original Sound</i>'
         )
 
-    def fetch_latest_video(self) -> dict:
+    def fetch_latest_video(self, profile: WatchProfile) -> dict:
         try:
             with YoutubeDL(self._ydl_opts()) as ydl:
-                info = ydl.extract_info(self.profile_url, download=False)
+                info = ydl.extract_info(profile.url, download=False)
         except Exception as e:
             return {
                 'status': 'error',
@@ -194,7 +261,7 @@ class TikTokProfileWatcher:
         latest = entries[0]
         video_id = str(latest.get('id') or '').strip()
         uploader_id = str(latest.get('uploader_id') or '').strip()
-        uploader_name = str(latest.get('uploader') or self.profile_username or '').strip()
+        uploader_name = str(latest.get('uploader') or profile.username or '').strip()
         channel_name = str(latest.get('channel') or '').strip()
         title = str(latest.get('title') or '').strip()
         video_url = str(latest.get('webpage_url') or latest.get('url') or '').strip()
@@ -218,7 +285,13 @@ class TikTokProfileWatcher:
             'title': title,
         }
 
-    async def _notify_owner(self, bot: Bot, latest: dict, chat_id: int | None = None) -> bool:
+    async def _notify_owner(
+        self,
+        bot: Bot,
+        latest: dict,
+        profile: WatchProfile,
+        chat_id: int | None = None,
+    ) -> bool:
         file_path = ''
         caption = ''
         download_info = {}
@@ -239,7 +312,8 @@ class TikTokProfileWatcher:
                     chat_id=target_chat_id,
                     text=(
                         f'{self._custom_emoji("bell")} '
-                        f'Новое видео: <a href="{html.escape(str(latest.get("video_url") or ""), quote=True)}">Ссылка</a>'
+                        f'Новое видео @{html.escape(profile.username or profile.label)}: '
+                        f'<a href="{html.escape(str(latest.get("video_url") or ""), quote=True)}">Ссылка</a>'
                     ),
                     disable_web_page_preview=True,
                     message_thread_id=target_thread_id or None,
@@ -247,7 +321,7 @@ class TikTokProfileWatcher:
                 return True
 
             file_path = download_info['file_path']
-            caption = self._build_caption(latest, download_info)
+            caption = self._build_caption(latest, download_info, profile)
 
             input_file = FSInputFile(file_path)
             await bot.send_video(
@@ -279,7 +353,7 @@ class TikTokProfileWatcher:
                 )
                 return True
             except Exception:
-                logger.warning('Failed to send profile watcher notification: %s', e)
+                logger.warning('Failed to send profile watcher notification (%s): %s', profile.key, e)
             return False
         finally:
             if file_path and os.path.exists(file_path):
@@ -288,12 +362,24 @@ class TikTokProfileWatcher:
                 except OSError:
                     pass
 
-    async def send_latest_preview(self, bot: Bot, chat_id: int | None = None) -> dict:
-        latest = await asyncio.to_thread(self.fetch_latest_video)
+    async def send_latest_preview(
+        self,
+        bot: Bot,
+        chat_id: int | None = None,
+        profile_key: str | None = None,
+    ) -> dict:
+        profile = self._resolve_profile(profile_key)
+        if not profile:
+            return {
+                'status': 'error',
+                'message': 'Профиль для теста не найден',
+            }
+
+        latest = await asyncio.to_thread(self.fetch_latest_video, profile)
         if latest.get('status') != 'success':
             return latest
 
-        notified = await self._notify_owner(bot, latest, chat_id=chat_id)
+        notified = await self._notify_owner(bot, latest, profile, chat_id=chat_id)
         if not notified:
             return {
                 'status': 'error',
@@ -302,6 +388,7 @@ class TikTokProfileWatcher:
 
         return {
             'status': 'success',
+            'profile': profile.key,
             'video_id': latest.get('video_id', ''),
             'video_url': latest.get('video_url', ''),
         }
@@ -312,8 +399,8 @@ class TikTokProfileWatcher:
             return
 
         logger.info(
-            'TikTok profile watcher enabled: profile=%s interval=%ss target_chat_id=%s thread_id=%s',
-            self.profile_url,
+            'TikTok profile watcher enabled: profiles=%s interval=%ss target_chat_id=%s thread_id=%s',
+            len(self.profiles),
             self.poll_seconds,
             self.target_chat_id,
             self.target_thread_id,
@@ -321,21 +408,29 @@ class TikTokProfileWatcher:
 
         while True:
             try:
-                latest = await asyncio.to_thread(self.fetch_latest_video)
-                if latest.get('status') != 'success':
-                    logger.warning('TikTok profile watcher probe failed: %s', latest.get('message', 'Unknown error'))
-                else:
+                for profile in self.profiles:
+                    latest = await asyncio.to_thread(self.fetch_latest_video, profile)
+                    if latest.get('status') != 'success':
+                        logger.warning(
+                            'TikTok profile watcher probe failed (%s): %s',
+                            profile.key,
+                            latest.get('message', 'Unknown error'),
+                        )
+                        continue
+
                     latest_video_id = latest['video_id']
-                    last_known_video_id = await get_app_state(self.state_key)
+                    last_known_video_id = await get_app_state(profile.state_key)
 
                     if not last_known_video_id:
-                        await set_app_state(self.state_key, latest_video_id)
-                        logger.info('TikTok watcher initialized at video id: %s', latest_video_id)
-                    elif latest_video_id != last_known_video_id:
-                        notified = await self._notify_owner(bot, latest)
+                        await set_app_state(profile.state_key, latest_video_id)
+                        logger.info('TikTok watcher initialized %s at video id: %s', profile.key, latest_video_id)
+                        continue
+
+                    if latest_video_id != last_known_video_id:
+                        notified = await self._notify_owner(bot, latest, profile)
                         if notified:
-                            await set_app_state(self.state_key, latest_video_id)
-                            logger.info('TikTok watcher new video notified: %s', latest_video_id)
+                            await set_app_state(profile.state_key, latest_video_id)
+                            logger.info('TikTok watcher new video notified %s: %s', profile.key, latest_video_id)
             except asyncio.CancelledError:
                 raise
             except Exception:

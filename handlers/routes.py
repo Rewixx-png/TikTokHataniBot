@@ -21,6 +21,7 @@ from core.database import cleanup_old_cache, get_cached_video, get_cached_video_
 from services.audio import ShazamService
 from services.downloader import TikTokDownloader
 from services.musicaldown import MusicalDownService
+from services.nim_commentary import NimCommentaryService
 from services.profile_watcher import TikTokProfileWatcher
 from services.snaptik import SnapTikService
 
@@ -30,6 +31,7 @@ downloader = TikTokDownloader()
 shazam_service = ShazamService()
 snaptik_service = SnapTikService()
 musicaldown_service = MusicalDownService()
+nim_commentary_service = NimCommentaryService()
 profile_watcher = TikTokProfileWatcher()
 
 URL_PATTERN = r'(https?://(?:www\.|vm\.|vt\.)?tiktok\.com/[^\s]+)'
@@ -409,6 +411,7 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
     height = int(info.get('height', 0) or 0)
     fps = int(info.get('fps', 0) or 0)
     song_name = html.escape(str(info.get('song_name', 'Original Sound')))
+    ai_comment = html.escape(str(info.get('ai_comment', '') or '').strip())
     quality_label = html.escape(info.get('quality_label', QUALITY_LABELS[QUALITY_HIGH]))
     requester_label = format_requester_label(requester)
 
@@ -423,6 +426,12 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
     if uploader_id and uploader_id != uploader_name:
         uploader_suffix = f' (@{uploader_id})'
 
+    ai_block = ''
+    if ai_comment:
+        if len(ai_comment) > 260:
+            ai_comment = ai_comment[:257] + '...'
+        ai_block = f'Ai:\n<blockquote>{ai_comment}</blockquote>\n\n'
+
     return (
         f'{custom_emoji("user")} <b>{uploader_name}</b>{uploader_suffix}{cached_mark}\n\n'
         f'{custom_emoji("info")} \n'
@@ -435,6 +444,7 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
         f'{custom_emoji("file")} {duration}s | {width}×{height} | {fps_text} | {file_size_mb:.1f}MB\n'
         f'{location_line}\n\n'
         f'{custom_emoji("song")} <i>{song_name}</i>\n\n'
+        f'{ai_block}'
         f'{custom_emoji("via")} via {requester_label}\n\n'
         f'{custom_emoji("speed")} ↓{times.get("download", 0):.1f}s | '
         f'↑{times.get("upload", 0):.1f}s | '
@@ -584,6 +594,13 @@ async def _process_download(
         cached['quality_label'] = QUALITY_LABELS.get(quality, QUALITY_LABELS[QUALITY_HIGH])
         cached = merge_probe_metadata(cached, probe_data)
 
+        if nim_commentary_service.enabled and not str(cached.get('ai_comment', '') or '').strip():
+            generated_comment = await nim_commentary_service.generate_comment(cached)
+            if generated_comment:
+                cached['ai_comment'] = generated_comment
+                cached['url'] = cache_key
+                await save_video_cache(cached)
+
         times = {
             'download': 0,
             'upload': 0,
@@ -701,11 +718,23 @@ async def _process_download(
         song_name = await shazam_service.recognize(file_path)
         recognize_time = time.time() - recognize_start
 
+        ai_comment = ''
+        if nim_commentary_service.enabled:
+            await status_message.edit_text('🤖 <b>Генерирую AI-комментарий...</b>', parse_mode='HTML')
+            ai_comment = await nim_commentary_service.generate_comment(
+                {
+                    **info,
+                    'song_name': song_name,
+                    'quality_label': quality_label,
+                }
+            )
+
         total_time = time.time() - total_start
 
         info.update(
             {
                 'song_name': song_name,
+                'ai_comment': ai_comment,
                 'cached': False,
                 'quality_label': quality_label,
             }
@@ -768,22 +797,34 @@ async def cmd_test_profile_watch_notification(message: types.Message):
         await message.reply('⛔ Команда доступна только владельцу бота в ЛС.')
         return
 
-    if not profile_watcher.profile_url:
-        await message.reply('⚠️ Не задан TIKTOK_WATCH_PROFILE_URL в окружении.')
+    if not profile_watcher.profiles:
+        await message.reply('⚠️ Не задан TIKTOK_WATCH_PROFILES или TIKTOK_WATCH_PROFILE_URL в окружении.')
         return
 
+    parts = (message.text or '').split(maxsplit=1)
+    requested_profile = parts[1].strip() if len(parts) > 1 else ''
+
     status = await message.reply('🧪 <b>Готовлю тестовое уведомление...</b>', parse_mode='HTML')
-    result = await profile_watcher.send_latest_preview(message.bot)
+    result = await profile_watcher.send_latest_preview(
+        message.bot,
+        profile_key=requested_profile or None,
+    )
 
     if result.get('status') == 'success':
+        profile_name = html.escape(str(result.get('profile') or requested_profile or 'default'))
         await status.edit_text(
-            f'✅ <b>Тестовое уведомление отправлено в чат:</b> <code>{profile_watcher.target_chat_id}</code>',
+            f'✅ <b>Тестовое уведомление отправлено в чат:</b> '
+            f'<code>{profile_watcher.target_chat_id}</code>\n'
+            f'Профиль: <code>{profile_name}</code>',
             parse_mode='HTML',
         )
         return
 
+    available_profiles = ', '.join(profile_watcher.profile_keys()[:10])
     await status.edit_text(
-        f'❌ <b>Тест не удался:</b>\n<code>{html.escape(result.get("message", "Unknown error"))}</code>',
+        f'❌ <b>Тест не удался:</b>\n'
+        f'<code>{html.escape(result.get("message", "Unknown error"))}</code>\n'
+        f'<i>Доступные профили: {html.escape(available_profiles)}</i>',
         parse_mode='HTML',
     )
 

@@ -25,6 +25,7 @@ async def init_db():
                 duration REAL DEFAULT 0,
                 file_size INTEGER DEFAULT 0,
                 song_name TEXT,
+                ai_comment TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -44,6 +45,8 @@ async def init_db():
         columns = [row[1] for row in await cursor.fetchall()]
         if 'view_count' not in columns:
             await db.execute("ALTER TABLE video_cache ADD COLUMN view_count INTEGER DEFAULT 0")
+        if 'ai_comment' not in columns:
+            await db.execute("ALTER TABLE video_cache ADD COLUMN ai_comment TEXT")
 
         await db.commit()
 
@@ -89,8 +92,8 @@ async def save_video_cache(data: dict):
             INSERT OR REPLACE INTO video_cache 
             (url, file_id, uploader, uploader_id, description, like_count, view_count, comment_count, 
              repost_count, upload_date, detected_country, width, height, fps, duration, 
-             file_size, song_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             file_size, song_name, ai_comment)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             data.get('url'),
             data.get('file_id'),
@@ -108,7 +111,8 @@ async def save_video_cache(data: dict):
             data.get('fps', 0),
             data.get('duration', 0),
             data.get('file_size', 0),
-            data.get('song_name')
+            data.get('song_name'),
+            data.get('ai_comment', ''),
         ))
         await db.commit()
 

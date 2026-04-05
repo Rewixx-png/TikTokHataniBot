@@ -113,10 +113,19 @@ Bot uses SQLite with following logic:
 | `DOWNLOAD_DIR` | Download directory (default: `./downloads`) | No |
 | `MAX_FILE_SIZE_MB` | Max upload size in MB (auto defaults to 50 or 2000 in local Bot API mode) | No |
 | `TIKTOK_WATCH_ENABLED` | Enables watched-profile notifications | No |
-| `TIKTOK_WATCH_PROFILE_URL` | TikTok profile URL to monitor for new videos | No |
+| `TIKTOK_WATCH_PROFILES` | Semicolon-separated watch list `Label|URL;Label|URL` | No |
+| `TIKTOK_WATCH_PROFILE_URL` | Single-profile fallback (legacy mode) | No |
+| `TIKTOK_WATCH_PROFILE_LABEL` | Optional label for legacy single-profile mode | No |
 | `TIKTOK_WATCH_POLL_SECONDS` | Poll interval in seconds (minimum 30) | No |
 | `TIKTOK_WATCH_TARGET_CHAT_ID` | Target chat ID for watcher alerts (supports supergroup numeric id) | No |
 | `TIKTOK_WATCH_TARGET_THREAD_ID` | Optional forum topic `message_thread_id` (`0` for General topic) | No |
+| `NIM_ENABLED` | Enables NVIDIA NIM AI caption commentary | No |
+| `NIM_API_KEY` | NVIDIA NIM API key (`nvapi-...`) | No |
+| `NIM_MODEL` | NIM model id (recommended: `meta/llama-3.3-70b-instruct`) | No |
+| `NIM_BASE_URL` | NIM OpenAI-compatible chat completions URL | No |
+| `NIM_TIMEOUT_SECONDS` | Timeout for AI request in seconds | No |
+| `NIM_MAX_COMMENT_CHARS` | Maximum length of generated AI comment | No |
+| `NIM_COMMENTARY_MODE` | `neutral` или `critical` (жесткая критика без оскорблений) | No |
 | `TELEGRAM_API_ID` | Telegram API ID for local Bot API container | For Docker local Bot API |
 | `TELEGRAM_API_HASH` | Telegram API hash for local Bot API container | For Docker local Bot API |
 | `TELEGRAM_BOT_API_BASE_URL` | Custom Bot API base URL (e.g. `http://127.0.0.1:18081`) | No |
@@ -134,7 +143,8 @@ Bot uses SQLite with following logic:
 ├── services/
 │   ├── audio.py       # Shazam recognition
 │   ├── downloader.py  # TikTok downloader (normal + metadata probe)
-│   ├── profile_watcher.py # Owner alerts for new videos on watched profile
+│   ├── nim_commentary.py # NVIDIA NIM AI caption commentary
+│   ├── profile_watcher.py # Alerts for new videos on watched profiles
 │   ├── snaptik.py     # Third-party download flow (high/original)
 │   └── __init__.py
 ├── downloads/         # Temporary download directory
