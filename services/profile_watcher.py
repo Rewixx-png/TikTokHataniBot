@@ -1,14 +1,18 @@
 import asyncio
 import datetime
 import html
+import json
 import logging
 import os
 import re
 from dataclasses import dataclass
+from http.cookiejar import MozillaCookieJar
+from pathlib import Path
 
 from aiogram import Bot
 from aiogram.types import FSInputFile
 from babel import Locale
+import requests
 from yt_dlp import YoutubeDL
 
 from core.config import (
@@ -36,6 +40,7 @@ CUSTOM_EMOJI = {
 }
 
 TG_EMOJI_TAG_RE = re.compile(r'<tg-emoji\s+emoji-id="[^"]+">([^<]*)</tg-emoji>')
+HATANI_HASHTAG_RE = re.compile(r'(?i)(?:^|\s)#hatanisquad\b')
 
 
 @dataclass(frozen=True)
@@ -59,6 +64,7 @@ class TikTokProfileWatcher:
         self.enabled = bool(TIKTOK_WATCH_ENABLED and self.target_chat_id and self.profiles)
         self.cookie_file = os.path.join(os.getcwd(), 'cookies.txt')
         self.downloader = TikTokDownloader()
+        self.milestone_rules = {}
 
     def _extract_username(self, profile_url: str) -> str:
         match = re.search(r'tiktok\.com/@([^/?]+)', profile_url or '', re.IGNORECASE)
@@ -146,6 +152,184 @@ class TikTokProfileWatcher:
 
         return options
 
+    def _milestone_state_key(self, profile_key: str, threshold: int) -> str:
+        return f'tiktok_milestone_sent:{profile_key}:{threshold}'
+
+    def _create_profile_session(self) -> requests.Session:
+        session = requests.Session()
+        session.headers.update(
+            {
+                'User-Agent': (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/122.0.0.0 Safari/537.36'
+                ),
+                'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+            }
+        )
+
+        cookie_path = Path(self.cookie_file)
+        if cookie_path.exists() and cookie_path.stat().st_size > 0:
+            try:
+                cookie_jar = MozillaCookieJar()
+                cookie_jar.load(str(cookie_path), ignore_discard=True, ignore_expires=True)
+                session.cookies.update(cookie_jar)
+            except Exception as e:
+                logger.warning('Failed to load watcher cookies: %s', e)
+
+        return session
+
+    def _extract_universal_data(self, html_text: str):
+        match = re.search(
+            r'<script[^>]+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
+            html_text or '',
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return None
+
+        try:
+            return json.loads(match.group(1))
+        except Exception:
+            return None
+
+    def _find_user_info(self, payload: dict, username: str) -> dict | None:
+        lower_username = str(username or '').strip().lower()
+
+        direct_user_info = (
+            (payload.get('__DEFAULT_SCOPE__') or {})
+            .get('webapp.user-detail', {})
+            .get('userInfo', {})
+        )
+
+        direct_unique_id = str((direct_user_info.get('user') or {}).get('uniqueId') or '').strip().lower()
+        if direct_unique_id and (not lower_username or direct_unique_id == lower_username):
+            return direct_user_info
+
+        found = []
+
+        def walk(node):
+            if isinstance(node, dict):
+                user_block = node.get('user') if isinstance(node.get('user'), dict) else None
+                if user_block and (node.get('statsV2') or node.get('stats')):
+                    candidate_id = str(user_block.get('uniqueId') or '').strip().lower()
+                    if candidate_id and (not lower_username or candidate_id == lower_username):
+                        found.append(node)
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(payload)
+        return found[0] if found else None
+
+    def _parse_follower_count(self, user_info: dict) -> int:
+        stats_v2 = user_info.get('statsV2') or {}
+        stats = user_info.get('stats') or {}
+
+        raw_count = stats_v2.get('followerCount')
+        if raw_count in (None, ''):
+            raw_count = stats.get('followerCount')
+
+        try:
+            return int(float(raw_count))
+        except (TypeError, ValueError):
+            return 0
+
+    def fetch_follower_count(self, profile: WatchProfile) -> dict:
+        try:
+            session = self._create_profile_session()
+            response = session.get(profile.url, timeout=40)
+        except Exception as e:
+            return {
+                'status': 'error',
+                'message': f'Profile request failed: {e}',
+            }
+
+        if response.status_code >= 400:
+            return {
+                'status': 'error',
+                'message': f'Profile request returned HTTP {response.status_code}',
+            }
+
+        payload = self._extract_universal_data(response.text or '')
+        if not isinstance(payload, dict):
+            return {
+                'status': 'error',
+                'message': 'Failed to parse profile payload',
+            }
+
+        user_info = self._find_user_info(payload, profile.username)
+        if not user_info:
+            return {
+                'status': 'error',
+                'message': 'Profile user info not found in payload',
+            }
+
+        follower_count = self._parse_follower_count(user_info)
+        if follower_count <= 0:
+            return {
+                'status': 'error',
+                'message': 'Follower count missing in profile payload',
+            }
+
+        return {
+            'status': 'success',
+            'follower_count': follower_count,
+        }
+
+    def _format_milestone_number(self, value: int) -> str:
+        return f'{int(value):,}'.replace(',', '.')
+
+    def _build_milestone_text(
+        self,
+        profile: WatchProfile,
+        follower_count: int,
+        threshold: int,
+        mention: str,
+        display_name: str,
+    ) -> str:
+        pretty_threshold = self._format_milestone_number(threshold)
+        safe_display_name = html.escape(display_name or profile.label or profile.username or profile.key)
+        safe_mention = html.escape(mention or '')
+
+        return (
+            f'{self._custom_emoji("bell")} <b>{safe_display_name}</b> '
+            f'поздравляем тебя ({safe_mention}) с <b>{pretty_threshold}</b> сабов! '
+            'Надеемся, что ты дальше продолжишь радовать нас своим контентом!'
+        )
+
+    async def _notify_milestone(
+        self,
+        bot: Bot,
+        profile: WatchProfile,
+        follower_count: int,
+        threshold: int,
+        mention: str,
+        display_name: str,
+        chat_id: int | None = None,
+    ) -> bool:
+        target_chat_id = int(chat_id or self.target_chat_id)
+        target_thread_id = self.target_thread_id if chat_id is None else 0
+
+        try:
+            await bot.send_message(
+                chat_id=target_chat_id,
+                text=self._build_milestone_text(
+                    profile=profile,
+                    follower_count=follower_count,
+                    threshold=threshold,
+                    mention=mention,
+                    display_name=display_name,
+                ),
+                message_thread_id=target_thread_id or None,
+            )
+            return True
+        except Exception as e:
+            logger.warning('Failed to send milestone notification (%s): %s', profile.key, e)
+            return False
+
     def _custom_emoji(self, name: str) -> str:
         emoji_id, fallback = CUSTOM_EMOJI[name]
         return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
@@ -212,9 +396,16 @@ class TikTokProfileWatcher:
         safe_display_name = html.escape(str(display_name))
         video_url = html.escape(str(latest.get('video_url') or ''), quote=True)
 
-        description = html.escape(str(info.get('description') or '').strip() or 'Без описания')
+        raw_description = str(info.get('description') or '').strip()
+        has_hatani_hashtag = bool(HATANI_HASHTAG_RE.search(raw_description))
+
+        description = html.escape(raw_description or 'Без описания')
         if len(description) > 300:
             description = description[:297] + '...'
+
+        thanks_line = ''
+        if has_hatani_hashtag:
+            thanks_line = '<b>Спасибо за ваш контент!</b>\n\n'
 
         duration = int(self._normalize_duration_seconds(info.get('duration', 0)))
         width = int(info.get('width', 0) or 0)
@@ -234,6 +425,7 @@ class TikTokProfileWatcher:
             f'{video_url}\n'
             f'{self._custom_emoji("info")} \n'
             f'<blockquote>{description}</blockquote>\n'
+            f'{thanks_line}'
             f'🎚️ Обычное\n'
             f'{self._custom_emoji("file")} {duration}s | {width}×{height} | {fps}fps | {file_size_mb:.1f}MB\n'
             f'{self._custom_emoji("date")} {upload_date}\n'
@@ -393,6 +585,62 @@ class TikTokProfileWatcher:
             'video_url': latest.get('video_url', ''),
         }
 
+    async def send_milestone_preview(
+        self,
+        bot: Bot,
+        profile_key: str | None = None,
+        chat_id: int | None = None,
+        force: bool = True,
+    ) -> dict:
+        profile = self._resolve_profile(profile_key)
+        if not profile:
+            return {
+                'status': 'error',
+                'message': 'Профиль для milestone-теста не найден',
+            }
+
+        rule = self.milestone_rules.get(profile.key)
+        if not rule:
+            return {
+                'status': 'error',
+                'message': f'Для профиля {profile.key} нет настроек milestone',
+            }
+
+        stats = await asyncio.to_thread(self.fetch_follower_count, profile)
+        if stats.get('status') != 'success':
+            return stats
+
+        follower_count = int(stats.get('follower_count') or 0)
+        threshold = int(rule.get('threshold') or 0)
+        if not force and follower_count < threshold:
+            return {
+                'status': 'not_reached',
+                'follower_count': follower_count,
+                'threshold': threshold,
+            }
+
+        sent = await self._notify_milestone(
+            bot=bot,
+            profile=profile,
+            follower_count=follower_count,
+            threshold=threshold,
+            mention=str(rule.get('mention') or ''),
+            display_name=str(rule.get('display_name') or profile.label or profile.username),
+            chat_id=chat_id,
+        )
+        if not sent:
+            return {
+                'status': 'error',
+                'message': 'Не удалось отправить milestone-уведомление',
+            }
+
+        return {
+            'status': 'success',
+            'profile': profile.key,
+            'follower_count': follower_count,
+            'threshold': threshold,
+        }
+
     async def run(self, bot: Bot):
         if not self.enabled:
             logger.info('TikTok profile watcher disabled')
@@ -431,6 +679,45 @@ class TikTokProfileWatcher:
                         if notified:
                             await set_app_state(profile.state_key, latest_video_id)
                             logger.info('TikTok watcher new video notified %s: %s', profile.key, latest_video_id)
+
+                    milestone_rule = self.milestone_rules.get(profile.key)
+                    if milestone_rule:
+                        threshold = int(milestone_rule.get('threshold') or 0)
+                        if threshold > 0:
+                            milestone_state_key = self._milestone_state_key(profile.key, threshold)
+                            already_sent = await get_app_state(milestone_state_key)
+                            if not already_sent:
+                                stats = await asyncio.to_thread(self.fetch_follower_count, profile)
+                                if stats.get('status') == 'success':
+                                    follower_count = int(stats.get('follower_count') or 0)
+                                    if follower_count >= threshold:
+                                        milestone_sent = await self._notify_milestone(
+                                            bot=bot,
+                                            profile=profile,
+                                            follower_count=follower_count,
+                                            threshold=threshold,
+                                            mention=str(milestone_rule.get('mention') or ''),
+                                            display_name=str(
+                                                milestone_rule.get('display_name')
+                                                or profile.label
+                                                or profile.username
+                                                or profile.key
+                                            ),
+                                        )
+                                        if milestone_sent:
+                                            await set_app_state(milestone_state_key, '1')
+                                            logger.info(
+                                                'Milestone notified %s threshold=%s followers=%s',
+                                                profile.key,
+                                                threshold,
+                                                follower_count,
+                                            )
+                                else:
+                                    logger.warning(
+                                        'Milestone stats check failed (%s): %s',
+                                        profile.key,
+                                        stats.get('message', 'Unknown error'),
+                                    )
             except asyncio.CancelledError:
                 raise
             except Exception:

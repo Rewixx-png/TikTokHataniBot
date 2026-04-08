@@ -37,10 +37,10 @@ class TikTokDownloader:
 
         if quality == 'normal':
             return (
-                'bv*[height<=720][ext=mp4]+ba[ext=m4a]/'
-                'b[height<=720][ext=mp4]/'
-                'b[height<=720]/'
-                'best[height<=720]/'
+                'bv*[ext=mp4]+ba[ext=m4a]/'
+                'bv*[ext=mp4]+ba/'
+                'b[ext=mp4]/'
+                'b/'
                 'best'
             )
 

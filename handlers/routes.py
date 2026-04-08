@@ -73,6 +73,7 @@ CUSTOM_EMOJI = {
 
 TG_EMOJI_TAG_RE = re.compile(r'<tg-emoji\s+emoji-id="[^"]+">([^<]*)</tg-emoji>')
 USERNAME_RE = re.compile(r'^[A-Za-z0-9_]{5,32}$')
+HATANI_HASHTAG_RE = re.compile(r'(?i)(?:^|\s)#hatanisquad\b')
 
 
 def custom_emoji(name: str) -> str:
@@ -393,11 +394,18 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
     uploader_name = html.escape(raw_uploader_name)
     uploader_id = html.escape(raw_uploader_id)
 
-    description = html.escape(info.get('description', '') or '')
+    raw_description = str(info.get('description', '') or '').strip()
+    has_hatani_hashtag = bool(HATANI_HASHTAG_RE.search(raw_description))
+
+    description = html.escape(raw_description)
     if not description:
         description = 'Без описания'
     if len(description) > 150:
         description = description[:147] + '...'
+
+    thanks_line = ''
+    if has_hatani_hashtag:
+        thanks_line = '<b>Спасибо за ваш контент!</b>\n\n'
 
     likes = format_number(info.get('like_count', 0))
     views = format_number(info.get('view_count', 0))
@@ -436,6 +444,7 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
         f'{custom_emoji("user")} <b>{uploader_name}</b>{uploader_suffix}{cached_mark}\n\n'
         f'{custom_emoji("info")} \n'
         f'<blockquote>{description}</blockquote>\n\n'
+        f'{thanks_line}'
         f'{custom_emoji("likes")} {likes}  '
         f'{custom_emoji("views")} {views}  '
         f'{custom_emoji("comments")} {comments}  '
@@ -655,7 +664,10 @@ async def _process_download(
                 else:
                     info = fallback_info
         else:
-            await status_message.edit_text('⏳ <b>Скачиваю видео с TikTok...</b>', parse_mode='HTML')
+            await status_message.edit_text(
+                '⏳ <b>Скачиваю видео с TikTok в лучшем доступном качестве...</b>',
+                parse_mode='HTML',
+            )
             info = await downloader.download_video(url, quality=quality)
 
         if info.get('status') == 'error':

@@ -126,6 +126,7 @@ Bot uses SQLite with following logic:
 | `NIM_TIMEOUT_SECONDS` | Timeout for AI request in seconds | No |
 | `NIM_MAX_COMMENT_CHARS` | Maximum length of generated AI comment | No |
 | `NIM_COMMENTARY_MODE` | `neutral` или `critical` (жесткая критика без оскорблений) | No |
+| `NIM_MAX_FRAMES` | Максимум кадров для VLM-анализа (рекомендуется 6-10) | No |
 | `TELEGRAM_API_ID` | Telegram API ID for local Bot API container | For Docker local Bot API |
 | `TELEGRAM_API_HASH` | Telegram API hash for local Bot API container | For Docker local Bot API |
 | `TELEGRAM_BOT_API_BASE_URL` | Custom Bot API base URL (e.g. `http://127.0.0.1:18081`) | No |
