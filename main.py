@@ -14,8 +14,10 @@ from core.config import (
     TELEGRAM_BOT_API_BASE_URL,
     TELEGRAM_BOT_API_IS_LOCAL,
 )
-from core.database import init_db
+from core.database import close_db, init_db
+from core.middleware import DatabaseSessionMiddleware
 from handlers.routes import router
+from services.bonus_tracker import bonus_tracker_service
 from services.profile_watcher import TikTokProfileWatcher
 
 
@@ -43,19 +45,27 @@ async def main():
 
     bot = Bot(**bot_kwargs)
     dp = Dispatcher()
+    dp.update.middleware(DatabaseSessionMiddleware())
     profile_watcher = TikTokProfileWatcher()
     watcher_task = None
+    bonus_task = None
 
     dp.include_router(router)
 
     try:
         watcher_task = asyncio.create_task(profile_watcher.run(bot))
+        bonus_task = asyncio.create_task(bonus_tracker_service.run())
         await dp.start_polling(bot)
     finally:
         if watcher_task:
             watcher_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await watcher_task
+        if bonus_task:
+            bonus_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await bonus_task
+        await close_db()
         await bot.session.close()
 
 

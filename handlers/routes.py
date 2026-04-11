@@ -10,6 +10,7 @@ import uuid
 from aiogram import F, Router, types
 from aiogram.filters import Command, CommandStart
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy.ext.asyncio import AsyncSession
 
 try:
     from babel import Locale
@@ -19,6 +20,7 @@ except Exception:
 from core.config import BOT_OWNER_ID, MAX_FILE_SIZE_BYTES
 from core.database import cleanup_old_cache, get_cached_video, get_cached_video_by_file_id, save_video_cache
 from services.audio import ShazamService
+from services.bonus_tracker import bonus_tracker_service
 from services.downloader import TikTokDownloader
 from services.musicaldown import MusicalDownService
 from services.nim_commentary import NimCommentaryService
@@ -83,6 +85,10 @@ def custom_emoji(name: str) -> str:
 
 def strip_custom_emoji_tags(text: str) -> str:
     return TG_EMOJI_TAG_RE.sub(r'\1', text)
+
+
+def contains_hatani_hashtag(description: str | None) -> bool:
+    return bool(HATANI_HASHTAG_RE.search(str(description or '')))
 
 
 def format_requester_label(requester: str) -> str:
@@ -395,7 +401,7 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
     uploader_id = html.escape(raw_uploader_id)
 
     raw_description = str(info.get('description', '') or '').strip()
-    has_hatani_hashtag = bool(HATANI_HASHTAG_RE.search(raw_description))
+    has_hatani_hashtag = contains_hatani_hashtag(raw_description)
 
     description = html.escape(raw_description)
     if not description:
@@ -435,7 +441,7 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
         uploader_suffix = f' (@{uploader_id})'
 
     ai_block = ''
-    if ai_comment:
+    if has_hatani_hashtag and ai_comment:
         if len(ai_comment) > 260:
             ai_comment = ai_comment[:257] + '...'
         ai_block = f'Ai:\n<blockquote>{ai_comment}</blockquote>\n\n'
@@ -594,6 +600,7 @@ async def _process_download(
     total_start = time.time()
     cache_key = _build_cache_key(url, quality)
     file_path = None
+    is_tiktok_album = bool((probe_data or {}).get('is_tiktok_album'))
 
     cached = await get_cached_video(cache_key)
     if cached:
@@ -603,7 +610,11 @@ async def _process_download(
         cached['quality_label'] = QUALITY_LABELS.get(quality, QUALITY_LABELS[QUALITY_HIGH])
         cached = merge_probe_metadata(cached, probe_data)
 
-        if nim_commentary_service.enabled and not str(cached.get('ai_comment', '') or '').strip():
+        cached_hashtag = contains_hatani_hashtag(cached.get('description'))
+        if not cached_hashtag:
+            cached['ai_comment'] = ''
+
+        if cached_hashtag and nim_commentary_service.enabled and not str(cached.get('ai_comment', '') or '').strip():
             generated_comment = await nim_commentary_service.generate_comment(cached)
             if generated_comment:
                 cached['ai_comment'] = generated_comment
@@ -631,13 +642,17 @@ async def _process_download(
                 reply_markup=_metadata_keyboard(),
             )
             await status_message.delete()
+            await bonus_tracker_service.register_video_if_eligible(
+                cached,
+                source_url=str(cached.get('source_url') or url),
+            )
             await cleanup_old_cache()
             return
         except Exception:
             await status_message.edit_text('⚠️ <b>Кэш невалиден, скачиваю заново...</b>', parse_mode='HTML')
 
     try:
-        if quality in {QUALITY_HIGH, QUALITY_ORIGINAL}:
+        if quality in {QUALITY_HIGH, QUALITY_ORIGINAL} and not is_tiktok_album:
             if quality == QUALITY_ORIGINAL:
                 await status_message.edit_text('🧬 <b>Ищу оригинальное качество через сторонние сервисы...</b>', parse_mode='HTML')
             else:
@@ -664,10 +679,16 @@ async def _process_download(
                 else:
                     info = fallback_info
         else:
-            await status_message.edit_text(
-                '⏳ <b>Скачиваю видео с TikTok в лучшем доступном качестве...</b>',
-                parse_mode='HTML',
-            )
+            if is_tiktok_album:
+                await status_message.edit_text(
+                    '🖼️ <b>Обнаружен TikTok альбом, собираю его в видео...</b>',
+                    parse_mode='HTML',
+                )
+            else:
+                await status_message.edit_text(
+                    '⏳ <b>Скачиваю видео с TikTok в лучшем доступном качестве...</b>',
+                    parse_mode='HTML',
+                )
             info = await downloader.download_video(url, quality=quality)
 
         if info.get('status') == 'error':
@@ -678,6 +699,7 @@ async def _process_download(
             return
 
         file_path = info['file_path']
+        is_tiktok_album = bool(info.get('is_tiktok_album') or is_tiktok_album)
         info = merge_probe_metadata(info, probe_data)
 
         if info['file_size'] > MAX_FILE_SIZE_BYTES:
@@ -727,11 +749,16 @@ async def _process_download(
         await status_message.edit_text('🎵 <b>Распознаю аудио...</b>', parse_mode='HTML')
 
         recognize_start = time.time()
-        song_name = await shazam_service.recognize(file_path)
-        recognize_time = time.time() - recognize_start
+        song_name = str(info.get('song_name') or '').strip()
+        if is_tiktok_album and song_name and song_name.lower() not in {'unknown', 'original sound'}:
+            recognize_time = 0.0
+        else:
+            song_name = await shazam_service.recognize(file_path)
+            recognize_time = time.time() - recognize_start
 
         ai_comment = ''
-        if nim_commentary_service.enabled:
+        has_hatani_tag = contains_hatani_hashtag(info.get('description'))
+        if nim_commentary_service.enabled and has_hatani_tag:
             await status_message.edit_text('🤖 <b>Генерирую AI-комментарий...</b>', parse_mode='HTML')
             ai_comment = await nim_commentary_service.generate_comment(
                 {
@@ -775,6 +802,11 @@ async def _process_download(
             info['file_id'] = file_id
             info['url'] = cache_key
             await save_video_cache(info)
+
+        await bonus_tracker_service.register_video_if_eligible(
+            info,
+            source_url=str(info.get('source_url') or url),
+        )
 
         await status_message.delete()
         await cleanup_old_cache()
@@ -841,6 +873,71 @@ async def cmd_test_profile_watch_notification(message: types.Message):
     )
 
 
+@router.message(Command('bonus'))
+async def cmd_bonus(message: types.Message):
+    await bonus_tracker_service.process_due_videos(limit=50)
+
+    parts = (message.text or '').split(maxsplit=1)
+    participant = parts[1].strip() if len(parts) > 1 else ''
+    if not participant and message.from_user and message.from_user.username:
+        participant = message.from_user.username
+
+    if not participant:
+        await message.reply(
+            'ℹ️ Укажи TikTok username: <code>/bonus tpebop.fx</code>\n'
+            'Или используй <code>/tb</code>, чтобы посмотреть общий топ.',
+            parse_mode='HTML',
+        )
+        return
+
+    profile = await bonus_tracker_service.bonus_for_participant(participant)
+    if (
+        profile.get('awarded_videos', 0) == 0
+        and profile.get('pending_videos', 0) == 0
+        and profile.get('processed_videos', 0) == 0
+    ):
+        await message.reply(
+            f'📭 По участнику <code>{html.escape(participant)}</code> бонусов пока нет.',
+            parse_mode='HTML',
+        )
+        return
+
+    display_name = html.escape(str(profile.get('display_name') or participant))
+    participant_key = html.escape(str(profile.get('participant') or participant))
+    bonus_points = float(profile.get('bonus_points', 0.0) or 0.0)
+    awarded_videos = int(profile.get('awarded_videos', 0) or 0)
+    pending_videos = int(profile.get('pending_videos', 0) or 0)
+
+    await message.reply(
+        f'🏅 <b>Бонусы участника</b>\n\n'
+        f'👤 <b>{display_name}</b> (@{participant_key})\n'
+        f'⭐ <b>{bonus_points:.2f}</b> бонусов\n'
+        f'✅ Начислено по видео: <b>{awarded_videos}</b>\n'
+        f'⏳ На проверке: <b>{pending_videos}</b>',
+        parse_mode='HTML',
+    )
+
+
+@router.message(Command('tb'))
+async def cmd_bonus_top(message: types.Message):
+    await bonus_tracker_service.process_due_videos(limit=50)
+
+    top = await bonus_tracker_service.top_bonus(limit=15)
+    if not top:
+        await message.reply('📭 Пока нет начисленных бонусов.')
+        return
+
+    lines = ['🏆 <b>Топ по бонусам</b>', '']
+    for index, item in enumerate(top, start=1):
+        display_name = html.escape(str(item.get('display_name') or item.get('participant') or 'unknown'))
+        participant_key = html.escape(str(item.get('participant') or 'unknown'))
+        points = float(item.get('bonus_points', 0.0) or 0.0)
+        videos = int(item.get('awarded_videos', 0) or 0)
+        lines.append(f'{index}. <b>{display_name}</b> (@{participant_key}) — <b>{points:.2f}</b> ⭐ ({videos} видео)')
+
+    await message.reply('\n'.join(lines), parse_mode='HTML')
+
+
 @router.message(F.text.regexp(URL_PATTERN))
 async def handle_tiktok_link(message: types.Message):
     match = re.search(URL_PATTERN, message.text or '')
@@ -885,7 +982,25 @@ async def handle_tiktok_link(message: types.Message):
             'width': 0,
             'height': 0,
             'fps': 0,
+            'is_tiktok_album': False,
         }
+
+    if probe.get('is_tiktok_album'):
+        requester = message.from_user.username or message.from_user.first_name or 'owner'
+        await status_msg.edit_text(
+            '🖼️ <b>Альбом найден.</b>\n'
+            '⏳ Загружаю в обычном качестве и собираю плавное слайд-шоу...',
+            parse_mode='HTML',
+        )
+        await _process_download(
+            target_message=message,
+            status_message=status_msg,
+            url=url,
+            quality=QUALITY_NORMAL,
+            requester=requester,
+            probe_data=probe,
+        )
+        return
 
     _cleanup_pending_requests()
 
@@ -898,8 +1013,10 @@ async def handle_tiktok_link(message: types.Message):
         'created_at': time.time(),
     }
 
+    content_label = 'Альбом найден' if probe.get('is_tiktok_album') else 'Видео найдено'
+
     await status_msg.edit_text(
-        '✅ <b>Видео найдено</b>\n'
+        f'✅ <b>{content_label}</b>\n'
         'Выбери качество:\n\n'
         '📉 <b>Обычное</b> - Скачаем по обычному через yt-dlp\n'
         '⚡ <b>Высокое</b> - Скачаем через сторонний сервис с максимальным качеством\n'
@@ -910,7 +1027,10 @@ async def handle_tiktok_link(message: types.Message):
 
 
 @router.callback_query(F.data == REFRESH_META_CALLBACK)
-async def handle_refresh_metadata(callback: types.CallbackQuery):
+async def handle_refresh_metadata(
+    callback: types.CallbackQuery,
+    session: AsyncSession,
+):
     message = callback.message
     if not message:
         await callback.answer('Сообщение не найдено', show_alert=True)
@@ -926,7 +1046,7 @@ async def handle_refresh_metadata(callback: types.CallbackQuery):
         await callback.answer('Не удалось определить файл сообщения', show_alert=True)
         return
 
-    cached = await get_cached_video_by_file_id(file_id)
+    cached = await get_cached_video_by_file_id(file_id, session=session)
     if not cached:
         await callback.answer('Кэш не найден, отправь ссылку заново', show_alert=True)
         return
@@ -961,7 +1081,7 @@ async def handle_refresh_metadata(callback: types.CallbackQuery):
         await callback.answer('Не удалось обновить сообщение', show_alert=True)
         return
 
-    await save_video_cache(refreshed)
+    await save_video_cache(refreshed, session=session)
     await callback.answer('Данные TikTok обновлены ✅')
 
 

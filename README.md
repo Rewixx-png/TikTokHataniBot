@@ -33,6 +33,7 @@
 - 🎵 **Audio Recognition** — Shazam integration for track identification
 - 🔔 **Profile Watcher** — Optional alerts in configured chat/topic when watched TikTok profile posts a new video
 - 💾 **Smart Caching** — SQLite-based cache with 7-day TTL prevents re-downloading same videos
+- 🧱 **DB Layer** — SQLAlchemy 2.0 Async + repository pattern + Alembic migrations
 - 📊 **Rich Metadata** — Likes, comments, reposts, resolution, FPS, file size, upload date
 - 🌍 **Geolocation** — Detects country of upload when available
 - 🐳 **Docker Ready** — Includes local Telegram Bot API server in Docker Compose
@@ -92,7 +93,8 @@ Cached videos marked with `♻️` and served instantly.
 | Downloader | [yt-dlp](https://github.com/yt-dlp/yt-dlp) (`Normal` + probe/metadata) |
 | High/Original mode | Third-party service flow (cloudscraper session) |
 | Audio ID | [Shazamio](https://github.com/dotX12/ShazamIO) |
-| Database | SQLite (aiosqlite) |
+| Database | SQLite + SQLAlchemy 2.0 Async |
+| Migrations | Alembic |
 | Deployment | Docker + Docker Compose |
 
 ## Caching
@@ -109,6 +111,7 @@ Bot uses SQLite with following logic:
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `BOT_TOKEN` | Telegram Bot Token from [@BotFather](https://t.me/botfather) | Yes |
+| `DATABASE_URL` | SQLAlchemy async URL (default: `sqlite+aiosqlite:///.../cache.db`) | No |
 | `BOT_OWNER_ID` | Telegram user ID allowed to run `/test` watcher command in private chat | No |
 | `DOWNLOAD_DIR` | Download directory (default: `./downloads`) | No |
 | `MAX_FILE_SIZE_MB` | Max upload size in MB (auto defaults to 50 or 2000 in local Bot API mode) | No |
@@ -132,13 +135,37 @@ Bot uses SQLite with following logic:
 | `TELEGRAM_BOT_API_BASE_URL` | Custom Bot API base URL (e.g. `http://127.0.0.1:18081`) | No |
 | `TELEGRAM_BOT_API_IS_LOCAL` | Set `1` when using Telegram Bot API in local mode | No |
 
+## Migrations (Alembic)
+
+```bash
+# 1) install dependencies
+pip install -r requirements.txt
+
+# 2) create first migration automatically from models
+alembic revision --autogenerate -m "initial schema"
+
+# 3) apply migrations
+alembic upgrade head
+```
+
+For an existing database that was created before Alembic, mark current schema as baseline first:
+
+```bash
+alembic stamp head
+```
+
 ## Project Structure
 
 ```
 .
 ├── core/
 │   ├── config.py      # Configuration & constants
-│   └── database.py    # SQLite cache layer
+│   ├── database.py    # SQLAlchemy async engine + repositories
+│   ├── middleware.py  # Aiogram middleware with AsyncSession injection
+│   └── models.py      # SQLAlchemy ORM models
+├── alembic/           # Alembic migrations
+│   ├── env.py
+│   └── versions/
 ├── handlers/
 │   └── routes.py      # Bot command handlers
 ├── services/

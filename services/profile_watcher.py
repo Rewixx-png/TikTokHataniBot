@@ -24,6 +24,7 @@ from core.config import (
     TIKTOK_WATCH_TARGET_THREAD_ID,
 )
 from core.database import get_app_state, set_app_state
+from services.bonus_tracker import bonus_tracker_service
 from services.downloader import TikTokDownloader
 
 
@@ -433,6 +434,24 @@ class TikTokProfileWatcher:
             f'{self._custom_emoji("song")} <i>Original Sound</i>'
         )
 
+    async def _register_bonus_candidate(self, latest: dict, info: dict | None) -> None:
+        payload = dict(info or {})
+        source_url = str(payload.get('source_url') or latest.get('video_url') or '').strip()
+        if not source_url:
+            return
+
+        if not str(payload.get('description') or '').strip():
+            payload['description'] = str(latest.get('title') or '').strip()
+        if not str(payload.get('uploader') or '').strip():
+            payload['uploader'] = str(latest.get('uploader_name') or latest.get('channel_name') or '').strip()
+        if not str(payload.get('uploader_id') or '').strip():
+            payload['uploader_id'] = str(latest.get('uploader_id') or '').strip()
+
+        try:
+            await bonus_tracker_service.register_video_if_eligible(payload, source_url=source_url)
+        except Exception as e:
+            logger.debug('Bonus candidate registration skipped (%s): %s', source_url, e)
+
     def fetch_latest_video(self, profile: WatchProfile) -> dict:
         try:
             with YoutubeDL(self._ydl_opts()) as ydl:
@@ -510,6 +529,7 @@ class TikTokProfileWatcher:
                     disable_web_page_preview=True,
                     message_thread_id=target_thread_id or None,
                 )
+                await self._register_bonus_candidate(latest, latest)
                 return True
 
             file_path = download_info['file_path']
@@ -526,6 +546,7 @@ class TikTokProfileWatcher:
                 duration=int(self._normalize_duration_seconds(download_info.get('duration') or 0)),
                 message_thread_id=target_thread_id or None,
             )
+            await self._register_bonus_candidate(latest, download_info)
             return True
         except Exception as e:
             try:
@@ -543,6 +564,7 @@ class TikTokProfileWatcher:
                     duration=int(self._normalize_duration_seconds(download_info.get('duration') or 0)),
                     message_thread_id=target_thread_id or None,
                 )
+                await self._register_bonus_candidate(latest, download_info)
                 return True
             except Exception:
                 logger.warning('Failed to send profile watcher notification (%s): %s', profile.key, e)

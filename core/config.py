@@ -1,5 +1,6 @@
 import os
 import re
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -53,6 +54,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is not set in .env file")
+
+DEFAULT_DB_PATH = Path(os.getcwd(), 'cache.db').resolve()
+DATABASE_URL = os.getenv('DATABASE_URL', f'sqlite+aiosqlite:///{DEFAULT_DB_PATH.as_posix()}').strip()
 
 DOWNLOAD_DIR = os.path.join(os.getcwd(), os.getenv("DOWNLOAD_DIR", "downloads"))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -142,3 +146,7 @@ NIM_TIMEOUT_SECONDS = max(5, _get_float_env("NIM_TIMEOUT_SECONDS", default=12.0)
 NIM_MAX_COMMENT_CHARS = max(120, min(350, _get_int_env("NIM_MAX_COMMENT_CHARS", default=220)))
 NIM_COMMENTARY_MODE = os.getenv("NIM_COMMENTARY_MODE", "neutral").strip().lower()
 NIM_MAX_FRAMES = max(3, min(16, _get_int_env("NIM_MAX_FRAMES", default=8)))
+
+BONUS_ENABLED = _get_bool_env('BONUS_ENABLED', default=True)
+BONUS_CHECK_DELAY_DAYS = max(1, _get_int_env('BONUS_CHECK_DELAY_DAYS', default=7))
+BONUS_CHECK_INTERVAL_SECONDS = max(300, _get_int_env('BONUS_CHECK_INTERVAL_SECONDS', default=3600))
