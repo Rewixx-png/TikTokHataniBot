@@ -26,6 +26,7 @@ services:
     volumes:
       - ./downloads:/app/downloads
       - ./cookies.txt:/app/cookies.txt
+      - ./cache.db:/app/cache.db
 
 volumes:
   telegram-bot-api-data:

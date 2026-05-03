@@ -10,7 +10,7 @@ from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 
 from aiogram import Bot
-from aiogram.types import FSInputFile
+from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from babel import Locale
 import requests
 from yt_dlp import YoutubeDL
@@ -494,7 +494,49 @@ class TikTokProfileWatcher:
             'uploader_name': uploader_name,
             'channel_name': channel_name,
             'title': title,
+            'formats': latest.get('formats', []),
         }
+
+    def _build_formats_keyboard(self, formats: list, video_id: str) -> InlineKeyboardMarkup:
+        buttons = []
+        video_formats = [f for f in formats if f.get('vcodec') != 'none']
+        
+        def sort_key(f):
+            res = f.get('height') or 0
+            size = f.get('filesize') or 0
+            return (res, size)
+            
+        video_formats.sort(key=sort_key, reverse=True)
+        
+        seen_labels = set()
+        
+        for f in video_formats:
+            res = f.get('resolution') or f.get('format_id') or 'unknown'
+            vcodec = f.get('vcodec', '')
+            size = f.get('filesize')
+            if size:
+                size_mb = f'{size / (1024 * 1024):.1f} MB'
+            else:
+                size_mb = '?'
+            fps = f.get('fps')
+            fps_str = f'p{fps}' if fps else ''
+            text = f"📥 {res}{fps_str} • {vcodec} • {size_mb}"
+            
+            if text in seen_labels:
+                continue
+                
+            format_id = f.get('format_id')
+            if format_id:
+                seen_labels.add(text)
+                cb_data = f"pdl:{video_id}:{format_id}"
+                if len(cb_data.encode('utf-8')) > 64:
+                    continue
+                buttons.append([InlineKeyboardButton(text=text, callback_data=cb_data)])
+                
+            if len(buttons) >= 8:
+                break
+                
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
 
     async def _notify_owner(
         self,
@@ -503,78 +545,34 @@ class TikTokProfileWatcher:
         profile: WatchProfile,
         chat_id: int | None = None,
     ) -> bool:
-        file_path = ''
-        caption = ''
-        download_info = {}
-        target_chat_id = int(chat_id or self.target_chat_id)
-        target_thread_id = self.target_thread_id if chat_id is None else 0
+        target_chat_id = chat_id or self.owner_id
+        if not target_chat_id or target_chat_id <= 0:
+            logger.warning('Target/Owner ID not set, cannot send private notification.')
+            return False
 
         try:
-            download_info = await self.downloader.download_video(
-                latest['video_url'],
-                quality='normal',
+            display_name = html.escape(profile.label or latest.get('channel_name') or profile.username or 'Автор')
+            video_url = html.escape(str(latest.get("video_url") or ""), quote=True)
+            
+            text = (
+                f'{self._custom_emoji("bell")} <a href="{video_url}">{display_name}</a> выложил новое видео\n\n'
+                f'Выжимка из тик тока:'
             )
-            if download_info.get('status') == 'error':
-                logger.warning(
-                    'Profile watcher failed to download new video, fallback to text message: %s',
-                    download_info.get('message', 'Unknown error'),
-                )
-                await bot.send_message(
-                    chat_id=target_chat_id,
-                    text=(
-                        f'{self._custom_emoji("bell")} '
-                        f'Новое видео @{html.escape(profile.username or profile.label)}: '
-                        f'<a href="{html.escape(str(latest.get("video_url") or ""), quote=True)}">Ссылка</a>'
-                    ),
-                    disable_web_page_preview=True,
-                    message_thread_id=target_thread_id or None,
-                )
-                await self._register_bonus_candidate(latest, latest)
-                return True
-
-            file_path = download_info['file_path']
-            caption = self._build_caption(latest, download_info, profile)
-
-            input_file = FSInputFile(file_path)
-            await bot.send_video(
+            
+            formats = latest.get('formats', [])
+            keyboard = self._build_formats_keyboard(formats, latest.get('video_id', ''))
+            
+            await bot.send_message(
                 chat_id=target_chat_id,
-                video=input_file,
-                caption=caption,
-                parse_mode='HTML',
-                width=int(download_info.get('width') or 0),
-                height=int(download_info.get('height') or 0),
-                duration=int(self._normalize_duration_seconds(download_info.get('duration') or 0)),
-                message_thread_id=target_thread_id or None,
+                text=text,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+                parse_mode='HTML'
             )
-            await self._register_bonus_candidate(latest, download_info)
             return True
         except Exception as e:
-            try:
-                if not file_path:
-                    raise RuntimeError('No local video for fallback send')
-                fallback_caption = self._strip_custom_emoji_tags(caption)
-                input_file = FSInputFile(file_path)
-                await bot.send_video(
-                    chat_id=target_chat_id,
-                    video=input_file,
-                    caption=fallback_caption,
-                    parse_mode='HTML',
-                    width=int(download_info.get('width') or 0),
-                    height=int(download_info.get('height') or 0),
-                    duration=int(self._normalize_duration_seconds(download_info.get('duration') or 0)),
-                    message_thread_id=target_thread_id or None,
-                )
-                await self._register_bonus_candidate(latest, download_info)
-                return True
-            except Exception:
-                logger.warning('Failed to send profile watcher notification (%s): %s', profile.key, e)
+            logger.warning('Failed to send profile watcher notification (%s): %s', profile.key, e)
             return False
-        finally:
-            if file_path and os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except OSError:
-                    pass
 
     async def send_latest_preview(
         self,

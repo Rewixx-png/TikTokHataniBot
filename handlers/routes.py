@@ -58,8 +58,12 @@ REFRESH_META_CALLBACK = 'meta:update'
 RU_LOCALE = Locale.parse('ru') if Locale else None
 
 CUSTOM_EMOJI = {
+    'bell': ('6039486778597970865', '🔔'),
     'user': ('5904630315946611415', '👤'),
+    'success': ('5774022692642492953', '✅'),
+    'video': ('5884252508603289902', '🎥'),
     'info': ('6028435952299413210', 'ℹ️'),
+    'exclamation': ('6030563507299160824', '❗️'),
     'likes': ('5116368680279606270', '♥️'),
     'views': ('6037397706505195857', '👁'),
     'comments': ('5886436057091673541', '💬'),
@@ -131,30 +135,68 @@ def _build_cache_key(url: str, quality: str) -> str:
     return f'{quality}|{url}'
 
 
-def _quality_keyboard(request_id: str) -> InlineKeyboardMarkup:
+def _main_keyboard(request_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text='📉 Обычное',
-                    callback_data=f'qsel:{request_id}:{QUALITY_NORMAL}',
-                    style='primary',
-                ),
-                InlineKeyboardButton(
-                    text='⚡ Высокое',
-                    callback_data=f'qsel:{request_id}:{QUALITY_HIGH}',
-                    style='success',
+                    text='ℹ️ Форматы',
+                    callback_data=f'qsel:{request_id}:formats',
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text='🧬 Оригинальное',
+                    text='⚡ Высокое',
+                    callback_data=f'qsel:{request_id}:{QUALITY_HIGH}',
+                ),
+                InlineKeyboardButton(
+                    text='🎥 Оригинальное',
                     callback_data=f'qsel:{request_id}:{QUALITY_ORIGINAL}',
-                    style='danger',
                 ),
             ],
         ]
     )
+
+def _build_user_formats_keyboard(formats: list, request_id: str) -> InlineKeyboardMarkup:
+    buttons = []
+    video_formats = [f for f in formats if f.get('vcodec') != 'none']
+    
+    def sort_key(f):
+        res = f.get('height') or 0
+        size = f.get('filesize') or 0
+        return (res, size)
+        
+    video_formats.sort(key=sort_key, reverse=True)
+    
+    seen_labels = set()
+    
+    for f in video_formats:
+        res = f.get('resolution') or f.get('format_id') or 'unknown'
+        vcodec = f.get('vcodec', '')
+        size = f.get('filesize')
+        if size:
+            size_mb = f'{size / (1024 * 1024):.1f} MB'
+        else:
+            size_mb = '?'
+        fps = f.get('fps')
+        fps_str = f'p{fps}' if fps else ''
+        text = f"📥 {res}{fps_str} • {vcodec} • {size_mb}"
+        
+        if text in seen_labels:
+            continue
+            
+        format_id = f.get('format_id')
+        if format_id:
+            seen_labels.add(text)
+            cb_data = f"udl:{request_id}:{format_id}"
+            if len(cb_data.encode('utf-8')) > 64:
+                continue
+            buttons.append([InlineKeyboardButton(text=text, callback_data=cb_data)])
+            
+        if len(buttons) >= 8:
+            break
+            
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def _metadata_keyboard() -> InlineKeyboardMarkup:
@@ -384,7 +426,7 @@ def merge_probe_metadata(info: dict, probe_data: dict | None) -> dict:
     return info
 
 
-def build_caption(info: dict, requester: str, times: dict) -> str:
+def build_caption(info: dict, requester: str, times: dict, is_watcher: bool = False, original_url: str = '') -> str:
     raw_uploader_name = str(info.get('uploader') or '').strip()
     raw_uploader_id = str(info.get('uploader_id') or '').strip()
 
@@ -446,26 +488,56 @@ def build_caption(info: dict, requester: str, times: dict) -> str:
             ai_comment = ai_comment[:257] + '...'
         ai_block = f'Ai:\n<blockquote>{ai_comment}</blockquote>\n\n'
 
-    return (
-        f'{custom_emoji("user")} <b>{uploader_name}</b>{uploader_suffix}{cached_mark}\n\n'
-        f'{custom_emoji("info")} \n'
-        f'<blockquote>{description}</blockquote>\n\n'
-        f'{thanks_line}'
-        f'{custom_emoji("likes")} {likes}  '
-        f'{custom_emoji("views")} {views}  '
-        f'{custom_emoji("comments")} {comments}  '
-        f'{custom_emoji("reposts")} {reposts}\n\n'
-        f'🎚️ <b>{quality_label}</b>\n'
-        f'{custom_emoji("file")} {duration}s | {width}×{height} | {fps_text} | {file_size_mb:.1f}MB\n'
-        f'{location_line}\n\n'
-        f'{custom_emoji("song")} <i>{song_name}</i>\n\n'
-        f'{ai_block}'
-        f'{custom_emoji("via")} via {requester_label}\n\n'
-        f'{custom_emoji("speed")} ↓{times.get("download", 0):.1f}s | '
-        f'↑{times.get("upload", 0):.1f}s | '
-        f'{custom_emoji("speed_song")} {times.get("recognize", 0):.1f}s | '
-        f'<b>Σ{times.get("total", 0):.1f}s</b>'
-    )
+    video_url = original_url or info.get('source_url') or info.get('webpage_url')
+    if not video_url:
+        raw_url = str(info.get('url', ''))
+        if '|' in raw_url:
+            video_url = raw_url.split('|', 1)[1]
+        else:
+            video_url = raw_url
+
+    if is_watcher:
+        region_line = ''
+        if region_text:
+            region_line = f'{custom_emoji("region")} Регион: {html.escape(region_text)} | '
+
+        return (
+            f'{custom_emoji("bell")} <a href="https://www.tiktok.com/@{uploader_id}">{uploader_name}</a> • Via — <a href="{video_url}">CLICK</a>\n\n'
+            f'<blockquote>{custom_emoji("info")} {description}</blockquote>\n'
+            f'{thanks_line}'
+            f'🎚️ {quality_label}\n'
+            f'{custom_emoji("file")} {duration}s | {width}×{height} | {fps_text} | {file_size_mb:.1f}MB\n'
+            f'{custom_emoji("date")} {upload_date}\n'
+            f'{region_line}{custom_emoji("song")} <i>{song_name}</i>'
+        )
+    else:
+        uploader_str = f'{custom_emoji("user")} {uploader_name}{cached_mark}'
+        if uploader_id and uploader_id != uploader_name:
+            uploader_str += f'\n   •   (@{uploader_id})'
+
+        region_line_full = ''
+        if region_text:
+            region_line_full = f'   |   Регион: {html.escape(region_text)}'
+
+        return (
+            f'{uploader_str}\n\n'
+            f'<blockquote>{custom_emoji("exclamation")} {description}</blockquote>\n\n'
+            f'{thanks_line}'
+            f'{custom_emoji("likes")} {likes}  '
+            f'{custom_emoji("views")} {views}  '
+            f'{custom_emoji("comments")} {comments}  '
+            f'{custom_emoji("reposts")} {reposts}\n\n'
+            f'🎚️ <b>{quality_label}</b>\n'
+            f'{custom_emoji("file")} {duration}s | {width}×{height} | {fps_text} | {file_size_mb:.1f}MB\n\n'
+            f'{custom_emoji("date")} {upload_date}{region_line_full}\n\n'
+            f'{custom_emoji("song")} <i>{song_name}</i>\n\n'
+            f'{ai_block}'
+            f'{custom_emoji("via")} via {requester_label}\n\n'
+            f'{custom_emoji("speed")} ↓{times.get("download", 0):.1f}s | '
+            f'↑{times.get("upload", 0):.1f}s | '
+            f'{custom_emoji("speed_song")} {times.get("recognize", 0):.1f}s | '
+            f'<b>Σ{times.get("total", 0):.1f}s</b>'
+        )
 
 
 async def _send_media(
@@ -596,9 +668,15 @@ async def _process_download(
     quality: str,
     requester: str,
     probe_data: dict | None = None,
+    format_id: str | None = None,
+    is_watcher: bool = False,
 ):
     total_start = time.time()
-    cache_key = _build_cache_key(url, quality)
+    
+    if format_id:
+        cache_key = _build_cache_key(url, f"{quality}_{format_id}")
+    else:
+        cache_key = _build_cache_key(url, quality)
     file_path = None
     is_tiktok_album = bool((probe_data or {}).get('is_tiktok_album'))
 
@@ -614,7 +692,7 @@ async def _process_download(
         if not cached_hashtag:
             cached['ai_comment'] = ''
 
-        if cached_hashtag and nim_commentary_service.enabled and not str(cached.get('ai_comment', '') or '').strip():
+        if not is_watcher and cached_hashtag and nim_commentary_service.enabled and not str(cached.get('ai_comment', '') or '').strip():
             generated_comment = await nim_commentary_service.generate_comment(cached)
             if generated_comment:
                 cached['ai_comment'] = generated_comment
@@ -628,7 +706,7 @@ async def _process_download(
             'total': 0,
         }
 
-        caption = build_caption(cached, requester, times)
+        caption = build_caption(cached, requester, times, is_watcher=is_watcher)
 
         try:
             await _send_media_with_premium_retry(
@@ -639,7 +717,7 @@ async def _process_download(
                 width=cached.get('width', 0),
                 height=cached.get('height', 0),
                 duration=int(cached.get('duration', 0)),
-                reply_markup=_metadata_keyboard(),
+                reply_markup=None if is_watcher else _metadata_keyboard(),
             )
             await status_message.delete()
             await bonus_tracker_service.register_video_if_eligible(
@@ -666,7 +744,7 @@ async def _process_download(
                     parse_mode='HTML',
                 )
 
-                fallback_info = await downloader.download_video(url, quality=quality)
+                fallback_info = await downloader.download_video(url, quality=quality, format_id=format_id)
                 if fallback_info.get('status') == 'error':
                     external_details = '\n'.join(f'- {item}' for item in external_errors) or '- Unknown error'
                     info = {
@@ -758,7 +836,7 @@ async def _process_download(
 
         ai_comment = ''
         has_hatani_tag = contains_hatani_hashtag(info.get('description'))
-        if nim_commentary_service.enabled and has_hatani_tag:
+        if nim_commentary_service.enabled and has_hatani_tag and not is_watcher:
             await status_message.edit_text('🤖 <b>Генерирую AI-комментарий...</b>', parse_mode='HTML')
             ai_comment = await nim_commentary_service.generate_comment(
                 {
@@ -786,9 +864,9 @@ async def _process_download(
             'total': total_time,
         }
 
-        final_caption = build_caption(info, requester, times)
+        final_caption = build_caption(info, requester, times, is_watcher=is_watcher)
 
-        await _edit_caption_with_premium_retry(sent_message, final_caption, reply_markup=_metadata_keyboard())
+        await _edit_caption_with_premium_retry(sent_message, final_caption, reply_markup=None if is_watcher else _metadata_keyboard())
 
         file_id = None
         if quality == QUALITY_ORIGINAL:
@@ -851,14 +929,15 @@ async def cmd_test_profile_watch_notification(message: types.Message):
     status = await message.reply('🧪 <b>Готовлю тестовое уведомление...</b>', parse_mode='HTML')
     result = await profile_watcher.send_latest_preview(
         message.bot,
+        chat_id=message.chat.id,
         profile_key=requested_profile or None,
     )
 
     if result.get('status') == 'success':
         profile_name = html.escape(str(result.get('profile') or requested_profile or 'default'))
         await status.edit_text(
-            f'✅ <b>Тестовое уведомление отправлено в чат:</b> '
-            f'<code>{profile_watcher.target_chat_id}</code>\n'
+            f'✅ <b>Тестовое уведомление отправлено в этот чат:</b> '
+            f'<code>{message.chat.id}</code>\n'
             f'Профиль: <code>{profile_name}</code>',
             parse_mode='HTML',
         )
@@ -947,7 +1026,7 @@ async def handle_tiktok_link(message: types.Message):
 
     url = match.group(0)
 
-    status_msg = await message.reply('🔍 <b>Проверяю ссылку...</b>', parse_mode='HTML')
+    status_msg = await message.answer('🔍 <b>Проверяю ссылку...</b>', parse_mode='HTML')
 
     probe = await downloader.probe_video(url)
     if probe.get('status') == 'error':
@@ -1016,12 +1095,12 @@ async def handle_tiktok_link(message: types.Message):
     content_label = 'Альбом найден' if probe.get('is_tiktok_album') else 'Видео найдено'
 
     await status_msg.edit_text(
-        f'✅ <b>{content_label}</b>\n'
+        f'{custom_emoji("success")} <b>{content_label}</b>\n'
         'Выбери качество:\n\n'
-        '📉 <b>Обычное</b> - Скачаем по обычному через yt-dlp\n'
-        '⚡ <b>Высокое</b> - Скачаем через сторонний сервис с максимальным качеством\n'
-        '🧬 <b>Оригинальное</b> - Скачаем через сторонний сервис и отправим файлом с оригинальным качеством',
-        reply_markup=_quality_keyboard(request_id),
+        f'{custom_emoji("info")} <b>Форматы</b> - Сам сможешь посмотреть все допустимые форматы твоего видео в тт\n'
+        f'{custom_emoji("speed")} <b>Высокое</b> - Скачаем без водяного знака в высоком качестве\n'
+        f'{custom_emoji("video")} <b>Оригинальное</b> - Скачаем через сторонний сервис и отправим файлом с оригинальным качеством',
+        reply_markup=_main_keyboard(request_id),
         parse_mode='HTML',
     )
 
@@ -1085,6 +1164,100 @@ async def handle_refresh_metadata(
     await callback.answer('Данные TikTok обновлены ✅')
 
 
+@router.callback_query(F.data.startswith('pdl:'))
+async def handle_profile_download_callback(callback: types.CallbackQuery):
+    if not callback.message:
+        await callback.answer('Сообщение не найдено', show_alert=True)
+        return
+
+    parts = (callback.data or '').split(':', 2)
+    if len(parts) != 3:
+        await callback.answer('Некорректный формат запроса', show_alert=True)
+        return
+
+    _, video_id, format_id = parts
+
+    url = f"https://www.tiktok.com/@_/video/{video_id}"
+
+    await callback.answer('Начинаю загрузку...')
+    status_message = await callback.message.reply('⏳ <b>Подготавливаю загрузку выбранного формата...</b>', parse_mode='HTML')
+
+    try:
+        await callback.message.delete()
+    except Exception as e:
+        logger.warning(f"Failed to delete callback message: {e}")
+
+    requester = callback.from_user.username or callback.from_user.first_name or 'owner'
+
+    try:
+        await _process_download(
+            target_message=callback.message,
+            status_message=status_message,
+            url=url,
+            quality='normal',
+            requester=requester,
+            probe_data=None,
+            format_id=format_id,
+            is_watcher=True
+        )
+    except Exception as e:
+        logger.exception("Error in handle_profile_download_callback")
+        await status_message.edit_text(f"❌ <b>Произошла системная ошибка при загрузке:</b>\n<code>{html.escape(str(e))}</code>", parse_mode='HTML')
+
+@router.callback_query(F.data.startswith('udl:'))
+async def handle_user_download_callback(callback: types.CallbackQuery):
+    if not callback.message:
+        await callback.answer('Сообщение не найдено', show_alert=True)
+        return
+
+    parts = (callback.data or '').split(':', 2)
+    if len(parts) != 3:
+        await callback.answer('Некорректный формат запроса', show_alert=True)
+        return
+
+    _, request_id, format_id = parts
+
+    _cleanup_pending_requests()
+
+    request_data = pending_requests.get(request_id)
+    if not request_data:
+        await callback.answer('Запрос устарел. Отправь ссылку заново.', show_alert=True)
+        return
+
+    if (
+        request_data.get('user_id') != callback.from_user.id
+        or request_data.get('chat_id') != callback.message.chat.id
+    ):
+        await callback.answer('Этот запрос принадлежит другому пользователю', show_alert=True)
+        return
+
+    pending_requests.pop(request_id, None)
+
+    await callback.answer('Начинаю загрузку...')
+    
+    await callback.message.edit_text(
+        '⏳ <b>Подготавливаю загрузку выбранного формата...</b>',
+        parse_mode='HTML',
+        reply_markup=None,
+    )
+
+    requester = callback.from_user.username or callback.from_user.first_name or 'owner'
+
+    try:
+        await _process_download(
+            target_message=callback.message,
+            status_message=callback.message,
+            url=request_data['url'],
+            quality='normal',
+            requester=requester,
+            probe_data=request_data.get('probe'),
+            format_id=format_id,
+            is_watcher=False
+        )
+    except Exception as e:
+        logger.exception("Error in handle_user_download_callback")
+        await callback.message.edit_text(f"❌ <b>Произошла системная ошибка при загрузке:</b>\n<code>{html.escape(str(e))}</code>", parse_mode='HTML')
+
 @router.callback_query(F.data.startswith('qsel:'))
 async def handle_quality_callback(callback: types.CallbackQuery):
     if not callback.message:
@@ -1097,6 +1270,38 @@ async def handle_quality_callback(callback: types.CallbackQuery):
         return
 
     _, request_id, quality = parts
+    
+    if quality == 'formats':
+        request_data = pending_requests.get(request_id)
+        if not request_data:
+            await callback.answer('Запрос устарел. Отправь ссылку заново.', show_alert=True)
+            return
+            
+        if (
+            request_data.get('user_id') != callback.from_user.id
+            or request_data.get('chat_id') != callback.message.chat.id
+        ):
+            await callback.answer('Этот запрос принадлежит другому пользователю', show_alert=True)
+            return
+
+        probe_data = request_data.get('probe', {})
+        formats = probe_data.get('formats', [])
+        
+        if not formats:
+            await callback.answer('Форматы недоступны для этого видео', show_alert=True)
+            return
+            
+        keyboard = _build_user_formats_keyboard(formats, request_id)
+        
+        await callback.message.edit_text(
+            '<b>Допустимые форматы:</b>\n\n'
+            '<i>Ниже представлены все доступные варианты загрузки для этого видео.\n'
+            'Выберите подходящий, чтобы начать скачивание.</i>',
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        return
+
     if quality not in QUALITY_LABELS:
         await callback.answer('Неизвестное качество', show_alert=True)
         return

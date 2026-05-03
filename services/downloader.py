@@ -1,3 +1,4 @@
+import asyncio
 import glob
 import datetime
 import json
@@ -471,7 +472,7 @@ class TikTokDownloader:
     def get_local_video_info(self, file_path: str) -> dict:
         return self._get_local_video_info(file_path)
 
-    async def probe_video(self, url: str) -> dict:
+    def _probe_video_sync(self, url: str) -> dict:
         source_url, is_tiktok_album = self._normalize_tiktok_url(url)
         if not source_url:
             return {
@@ -500,6 +501,7 @@ class TikTokDownloader:
                     'fps': 60,
                     'source_url': source_url,
                     'is_tiktok_album': True,
+                    'formats': [],
                 }
             except Exception:
                 pass
@@ -536,6 +538,7 @@ class TikTokDownloader:
                 'fps': info.get('fps') or 0,
                 'source_url': source_url,
                 'is_tiktok_album': is_tiktok_album,
+                'formats': info.get('formats', []),
             }
         except Exception as e:
             return {
@@ -543,7 +546,13 @@ class TikTokDownloader:
                 'message': str(e),
             }
 
-    async def download_video(self, url: str, quality: str = 'high') -> dict:
+    async def probe_video(self, url: str) -> dict:
+        return await asyncio.to_thread(self._probe_video_sync, url)
+
+    async def download_video(self, url: str, quality: str = 'high', format_id: str | None = None) -> dict:
+        return await asyncio.to_thread(self._download_video_sync, url, quality, format_id)
+
+    def _download_video_sync(self, url: str, quality: str = 'high', format_id: str | None = None) -> dict:
         source_url, is_tiktok_album = self._normalize_tiktok_url(url)
         if not source_url:
             return {
@@ -571,9 +580,11 @@ class TikTokDownloader:
                     'source_url': source_url,
                 }
 
+        format_selector = format_id if format_id else self._build_format_selector(quality)
+
         ydl_opts = self._base_ydl_opts()
         ydl_opts.update({
-            'format': self._build_format_selector(quality),
+            'format': format_selector,
             'outtmpl': f'{self.download_path}/{filename_id}.%(ext)s',
             'format_sort': ['res', 'fps', 'br', 'size'],
             'merge_output_format': 'mp4',
