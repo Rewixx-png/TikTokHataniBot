@@ -11,6 +11,7 @@ services:
       - "18081:8081"
     volumes:
       - telegram-bot-api-data:/var/lib/telegram-bot-api
+      - ./downloads:/root/Projects/TikTokHataniBot/downloads
 
   tt-bot:
     build: .
@@ -26,6 +27,8 @@ services:
     volumes:
       - ./downloads:/app/downloads
       - ./cookies.txt:/app/cookies.txt
+      - ./instagram_cookies.txt:/app/instagram_cookies.txt
+      - ./youtube_cookies.txt:/app/youtube_cookies.txt
       - ./cache.db:/app/cache.db
 
 volumes:

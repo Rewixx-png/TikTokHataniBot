@@ -55,7 +55,15 @@ async def main():
     try:
         watcher_task = asyncio.create_task(profile_watcher.run(bot))
         bonus_task = asyncio.create_task(bonus_tracker_service.run())
-        await dp.start_polling(bot)
+        await dp.start_polling(
+            bot,
+            allowed_updates=[
+                'message',
+                'callback_query',
+                'inline_query',
+                'chosen_inline_result',
+            ],
+        )
     finally:
         if watcher_task:
             watcher_task.cancel()

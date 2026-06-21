@@ -545,9 +545,9 @@ class TikTokProfileWatcher:
         profile: WatchProfile,
         chat_id: int | None = None,
     ) -> bool:
-        target_chat_id = chat_id or self.owner_id
+        target_chat_id = chat_id or self.target_chat_id
         if not target_chat_id or target_chat_id <= 0:
-            logger.warning('Target/Owner ID not set, cannot send private notification.')
+            logger.warning('Target chat ID not set, cannot send notification.')
             return False
 
         try:

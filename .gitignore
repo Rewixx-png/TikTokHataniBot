@@ -49,4 +49,9 @@ cache.db
 # Project specific
 downloads/*
 !downloads/.gitkeep
-cookies.txt
+cookies.txt*.mp4
+*.zip
+*.pth
+*.tar.gz
+*.rar
+*.pth.tar

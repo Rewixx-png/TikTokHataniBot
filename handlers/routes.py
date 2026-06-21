@@ -1,15 +1,21 @@
 import asyncio
+import contextlib
 import datetime
 import html
 import logging
 import os
 import re
+import shutil
 import time
 import uuid
 
 from aiogram import F, Router, types
 from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
+    InlineQuery, InlineQueryResultCachedVideo, InlineQueryResultArticle,
+    InputTextMessageContent,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 try:
@@ -21,7 +27,8 @@ from core.config import BOT_OWNER_ID, MAX_FILE_SIZE_BYTES
 from core.database import cleanup_old_cache, get_cached_video, get_cached_video_by_file_id, save_video_cache
 from services.audio import ShazamService
 from services.bonus_tracker import bonus_tracker_service
-from services.downloader import TikTokDownloader
+from services.downloader import TikTokDownloader, DownloadProgressTracker
+from services.media_downloader import detect_platform, download_media, probe_youtube_formats
 from services.musicaldown import MusicalDownService
 from services.nim_commentary import NimCommentaryService
 from services.profile_watcher import TikTokProfileWatcher
@@ -38,6 +45,16 @@ profile_watcher = TikTokProfileWatcher()
 
 URL_PATTERN = r'(https?://(?:www\.|vm\.|vt\.)?tiktok\.com/[^\s]+)'
 
+SOCIAL_URL_PATTERN = (
+    r'https?://'
+    r'(?:'
+    r'(?:(?:www\.|m\.)?youtube\.com/(?:watch|shorts|live|playlist|embed)|youtu\.be/|music\.youtube\.com/)'
+    r'|(?:www\.)?instagram\.com/(?:p|reel|tv|stories)/'
+    r'|(?:(?:[a-z]+\.)?pinterest\.[a-z]{2,}(?:\.[a-z]{2})?/|pin\.it/)'
+    r')'
+    r'[^\s]+'
+)
+
 QUALITY_NORMAL = 'normal'
 QUALITY_HIGH = 'high'
 QUALITY_ORIGINAL = 'original'
@@ -50,6 +67,24 @@ QUALITY_LABELS = {
 
 REQUEST_TTL_SECONDS = 10 * 60
 pending_requests: dict[str, dict] = {}
+pending_downloads: dict[str, dict] = {}
+yt_pending_requests: dict[str, dict] = {}
+
+_YT_QUALITY_MAP: dict[str, tuple[str, str]] = {
+    'best':  ('⭐ Макс',  'bestvideo+bestaudio/best'),
+    '4320':  ('8K',       'bestvideo[height<=4320]+bestaudio/best'),
+    '2160':  ('4K',       'bestvideo[height<=2160]+bestaudio/best'),
+    '1440':  ('1440p',    'bestvideo[height<=1440]+bestaudio/best'),
+    '1080':  ('1080p',    'bestvideo[height<=1080]+bestaudio/best'),
+    '720':   ('720p',     'bestvideo[height<=720]+bestaudio/best'),
+    '480':   ('480p',     'bestvideo[height<=480]+bestaudio/best'),
+    '360':   ('360p',     'bestvideo[height<=360]+bestaudio/best'),
+    '240':   ('240p',     'bestvideo[height<=240]+bestaudio/best'),
+    'audio': ('🎵 Аудио', 'bestaudio[ext=m4a]/bestaudio/best'),
+}
+
+_YT_HEIGHT_TO_KEY = {4320: '4320', 2160: '2160', 1440: '1440', 1080: '1080',
+                     720: '720', 480: '480', 360: '360', 240: '240'}
 logger = logging.getLogger(__name__)
 PREMIUM_RENDER_ATTEMPTS = 3
 PREMIUM_RETRY_STEP_SECONDS = 0.35
@@ -120,6 +155,42 @@ def _is_owner_private_message(message: types.Message) -> bool:
     chat_type = getattr(message.chat.type, 'value', message.chat.type)
     return str(chat_type).lower() == 'private' and message.from_user.id == BOT_OWNER_ID
 
+def _cleanup_yt_pending() -> None:
+    now = time.time()
+    for rid in [k for k, v in yt_pending_requests.items()
+                if now - v.get('created_at', 0) > REQUEST_TTL_SECONDS]:
+        yt_pending_requests.pop(rid, None)
+
+
+def _youtube_quality_keyboard(request_id: str, available_heights: list[int]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+
+    rows.append([InlineKeyboardButton(
+        text=_YT_QUALITY_MAP['best'][0],
+        callback_data=f'ytdl:{request_id}:best',
+    )])
+
+    available_keys = [
+        key for h, key in sorted(_YT_HEIGHT_TO_KEY.items(), reverse=True)
+        if h in available_heights
+    ]
+    row: list[InlineKeyboardButton] = []
+    for key in available_keys:
+        label = _YT_QUALITY_MAP[key][0]
+        row.append(InlineKeyboardButton(text=label, callback_data=f'ytdl:{request_id}:{key}'))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton(
+        text=_YT_QUALITY_MAP['audio'][0],
+        callback_data=f'ytdl:{request_id}:audio',
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _cleanup_pending_requests() -> None:
     now = time.time()
     expired_ids = [
@@ -157,6 +228,21 @@ def _main_keyboard(request_id: str) -> InlineKeyboardMarkup:
         ]
     )
 
+def _size_color(size_bytes: int) -> str:
+    mb = size_bytes / (1024 * 1024)
+    if mb < 5:
+        return '🟢'
+    if mb < 20:
+        return '🟡'
+    return '🔴'
+
+
+def _cancel_download_keyboard(dl_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='❌ Отменить', callback_data=f'cdl:{dl_id}')
+    ]])
+
+
 def _build_user_formats_keyboard(formats: list, request_id: str) -> InlineKeyboardMarkup:
     buttons = []
     video_formats = [f for f in formats if f.get('vcodec') != 'none']
@@ -175,12 +261,14 @@ def _build_user_formats_keyboard(formats: list, request_id: str) -> InlineKeyboa
         vcodec = f.get('vcodec', '')
         size = f.get('filesize')
         if size:
+            color = _size_color(size)
             size_mb = f'{size / (1024 * 1024):.1f} MB'
         else:
+            color = '⚪'
             size_mb = '?'
         fps = f.get('fps')
         fps_str = f'p{fps}' if fps else ''
-        text = f"📥 {res}{fps_str} • {vcodec} • {size_mb}"
+        text = f"{color} {res}{fps_str} • {vcodec} • {size_mb}"
         
         if text in seen_labels:
             continue
@@ -512,7 +600,7 @@ def build_caption(info: dict, requester: str, times: dict, is_watcher: bool = Fa
         )
     else:
         uploader_str = f'{custom_emoji("user")} {uploader_name}{cached_mark}'
-        if uploader_id and uploader_id != uploader_name:
+        if uploader_id and uploader_id != uploader_name and not uploader_id.isdigit():
             uploader_str += f'\n   •   (@{uploader_id})'
 
         region_line_full = ''
@@ -641,6 +729,26 @@ async def _edit_caption_with_premium_retry(
     await message.edit_caption(caption=fallback_caption, parse_mode='HTML', reply_markup=reply_markup)
 
 
+def _render_progress_bar(snap: dict) -> str:
+    pct = min(100.0, max(0.0, snap.get('percent', 0)))
+    filled = round(pct / 10)
+    bar = '█' * filled + '░' * (10 - filled)
+    parts = [f'<code>[{bar}] {pct:.0f}%</code>']
+    extra = []
+    speed = snap.get('speed', '')
+    eta = snap.get('eta', '')
+    total = snap.get('total', '')
+    if speed:
+        extra.append(f'🚀 {speed}')
+    if eta and eta not in ('--:--', '00:00'):
+        extra.append(f'⏱ {eta}')
+    if total:
+        extra.append(f'📦 {total}')
+    if extra:
+        parts.append(' | '.join(extra))
+    return '⬇️ <b>Скачиваю...</b>\n\n' + '\n'.join(parts)
+
+
 async def _download_through_external_services(url: str) -> tuple[dict | None, list[str]]:
     providers = (
         ('SnapTik', snaptik_service),
@@ -762,12 +870,47 @@ async def _process_download(
                     '🖼️ <b>Обнаружен TikTok альбом, собираю его в видео...</b>',
                     parse_mode='HTML',
                 )
+                info = await downloader.download_video(url, quality=quality)
             else:
+                tracker = DownloadProgressTracker()
+                dl_id = uuid.uuid4().hex[:8]
+                pending_downloads[dl_id] = {'cancelled': False}
+                cancel_kb = _cancel_download_keyboard(dl_id)
+
                 await status_message.edit_text(
-                    '⏳ <b>Скачиваю видео с TikTok в лучшем доступном качестве...</b>',
+                    '⬇️ <b>Скачиваю...</b>\n\n<code>[░░░░░░░░░░] 0%</code>',
                     parse_mode='HTML',
+                    reply_markup=cancel_kb,
                 )
-            info = await downloader.download_video(url, quality=quality)
+
+                async def _update_progress_bar() -> None:
+                    while True:
+                        await asyncio.sleep(1.5)
+                        if pending_downloads.get(dl_id, {}).get('cancelled'):
+                            break
+                        snap = tracker.snapshot()
+                        if snap['status'] == 'finished':
+                            break
+                        if snap['status'] == 'downloading':
+                            try:
+                                await status_message.edit_text(
+                                    _render_progress_bar(snap),
+                                    parse_mode='HTML',
+                                    reply_markup=cancel_kb,
+                                )
+                            except Exception:
+                                pass
+
+                progress_task = asyncio.create_task(_update_progress_bar())
+                try:
+                    info = await downloader.download_video(url, quality=quality, progress_tracker=tracker)
+                finally:
+                    progress_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await progress_task
+
+                if pending_downloads.pop(dl_id, {}).get('cancelled'):
+                    return
 
         if info.get('status') == 'error':
             await status_message.edit_text(
@@ -788,7 +931,11 @@ async def _process_download(
             )
             return
 
-        await status_message.edit_text('📤 <b>Загружаю в Telegram...</b>', parse_mode='HTML')
+        file_size_mb_str = f'{info["file_size"] / (1024 * 1024):.1f} MB'
+        await status_message.edit_text(
+            f'📤 <b>Загружаю в Telegram...</b>\n<code>📦 {file_size_mb_str}</code>',
+            parse_mode='HTML',
+        )
 
         upload_start = time.time()
 
@@ -1094,15 +1241,141 @@ async def handle_tiktok_link(message: types.Message):
 
     content_label = 'Альбом найден' if probe.get('is_tiktok_album') else 'Видео найдено'
 
+    uploader_name_preview = html.escape(str(probe.get('uploader') or 'Unknown'))
+    likes_preview = format_number(probe.get('like_count', 0))
+    views_preview = format_number(probe.get('view_count', 0))
+    duration_preview = int(normalize_duration_seconds(probe.get('duration', 0)))
+    desc_raw = str(probe.get('description', '') or '').strip()
+    desc_preview = html.escape(desc_raw[:80] + '...' if len(desc_raw) > 80 else desc_raw) or '—'
+
     await status_msg.edit_text(
-        f'{custom_emoji("success")} <b>{content_label}</b>\n'
-        'Выбери качество:\n\n'
-        f'{custom_emoji("info")} <b>Форматы</b> - Сам сможешь посмотреть все допустимые форматы твоего видео в тт\n'
-        f'{custom_emoji("speed")} <b>Высокое</b> - Скачаем без водяного знака в высоком качестве\n'
-        f'{custom_emoji("video")} <b>Оригинальное</b> - Скачаем через сторонний сервис и отправим файлом с оригинальным качеством',
+        f'{custom_emoji("success")} <b>{content_label}</b>\n\n'
+        f'{custom_emoji("user")} <b>{uploader_name_preview}</b>\n'
+        f'<blockquote>{desc_preview}</blockquote>\n'
+        f'{custom_emoji("likes")} {likes_preview}  {custom_emoji("views")} {views_preview}  ⏱ {duration_preview}s\n\n'
+        f'Выбери качество:\n'
+        f'{custom_emoji("info")} <b>Форматы</b> — все форматы с весом\n'
+        f'{custom_emoji("speed")} <b>Высокое</b> — без водяного знака\n'
+        f'{custom_emoji("video")} <b>Оригинальное</b> — файл в исходном качестве',
         reply_markup=_main_keyboard(request_id),
         parse_mode='HTML',
     )
+
+
+async def _send_downloaded_media(
+    target: types.Message,
+    status_msg: types.Message,
+    url: str,
+    platform: str,
+    format_selector: str | None = None,
+) -> None:
+    result = await download_media(url, platform, format_selector=format_selector)
+    if result['status'] == 'error':
+        await status_msg.edit_text(
+            f'❌ <b>Ошибка скачивания:</b>\n<code>{html.escape(result["message"])}</code>',
+            parse_mode='HTML',
+        )
+        return
+
+    file_path = result['file_path']
+    media_type = result['media_type']
+    tmp_dir = result.get('tmp_dir', '')
+    try:
+        input_file = FSInputFile(file_path)
+        if media_type == 'video':
+            await target.answer_video(video=input_file)
+        elif media_type == 'photo':
+            await target.answer_photo(photo=input_file)
+        elif media_type == 'audio':
+            await target.answer_audio(audio=input_file)
+        else:
+            await target.answer_document(document=input_file)
+        with contextlib.suppress(Exception):
+            await status_msg.delete()
+    except Exception as exc:
+        logger.exception('Failed to send media from %s', url)
+        await status_msg.edit_text(
+            f'❌ <b>Ошибка отправки:</b>\n<code>{html.escape(str(exc))}</code>',
+            parse_mode='HTML',
+        )
+    finally:
+        if tmp_dir and os.path.isdir(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@router.message(F.text.regexp(SOCIAL_URL_PATTERN))
+async def handle_social_media_link(message: types.Message):
+    match = re.search(SOCIAL_URL_PATTERN, message.text or '')
+    if not match:
+        return
+
+    url = match.group(0)
+    platform = detect_platform(url)
+    if not platform:
+        return
+
+    if platform == 'youtube':
+        status_msg = await message.answer('🔍 <b>Получаю форматы YouTube...</b>', parse_mode='HTML')
+        heights = await probe_youtube_formats(url)
+
+        _cleanup_yt_pending()
+        request_id = uuid.uuid4().hex[:12]
+        yt_pending_requests[request_id] = {
+            'url': url,
+            'user_id': message.from_user.id if message.from_user else 0,
+            'chat_id': message.chat.id,
+            'created_at': time.time(),
+        }
+        keyboard = _youtube_quality_keyboard(request_id, heights)
+        await status_msg.edit_text(
+            '🎬 <b>YouTube</b> — выбери качество:',
+            parse_mode='HTML',
+            reply_markup=keyboard,
+        )
+        return
+
+    status_msg = await message.answer('⏳ Качаю медиа...')
+    await _send_downloaded_media(message, status_msg, url, platform)
+
+
+@router.callback_query(F.data.startswith('ytdl:'))
+async def handle_youtube_quality_callback(callback: types.CallbackQuery):
+    if not callback.message:
+        await callback.answer('Сообщение не найдено', show_alert=True)
+        return
+
+    parts = (callback.data or '').split(':', 2)
+    if len(parts) != 3:
+        await callback.answer('Некорректный формат', show_alert=True)
+        return
+
+    _, request_id, quality_key = parts
+
+    _cleanup_yt_pending()
+    request_data = yt_pending_requests.pop(request_id, None)
+    if not request_data:
+        await callback.answer('Запрос устарел — отправь ссылку заново', show_alert=True)
+        return
+
+    if request_data.get('user_id') != callback.from_user.id:
+        await callback.answer('Это не твой запрос', show_alert=True)
+        return
+
+    quality_info = _YT_QUALITY_MAP.get(quality_key)
+    if not quality_info:
+        await callback.answer('Неизвестное качество', show_alert=True)
+        return
+
+    label, format_selector = quality_info
+    url = request_data['url']
+
+    await callback.answer()
+    await callback.message.edit_text(
+        f'⏳ Качаю <b>{label}</b>...',
+        parse_mode='HTML',
+        reply_markup=None,
+    )
+    await _send_downloaded_media(callback.message, callback.message, url, 'youtube', format_selector)
 
 
 @router.callback_query(F.data == REFRESH_META_CALLBACK)
@@ -1340,3 +1613,74 @@ async def handle_quality_callback(callback: types.CallbackQuery):
         requester=requester,
         probe_data=request_data.get('probe'),
     )
+
+
+@router.callback_query(F.data.startswith('cdl:'))
+async def handle_cancel_download(callback: types.CallbackQuery):
+    dl_id = (callback.data or '').split(':', 1)[1]
+    if dl_id in pending_downloads:
+        pending_downloads[dl_id]['cancelled'] = True
+    await callback.answer('Загрузка отменяется...')
+    try:
+        await callback.message.edit_text('❌ <b>Загрузка отменена</b>', parse_mode='HTML', reply_markup=None)
+    except Exception:
+        pass
+
+
+@router.inline_query()
+async def handle_inline_query(query: InlineQuery):
+    text = (query.query or '').strip()
+    match = re.search(URL_PATTERN, text)
+
+    if not match:
+        await query.answer(
+            results=[
+                InlineQueryResultArticle(
+                    id='hint',
+                    title='📥 Скачать видео TikTok',
+                    description='Вставьте ссылку TikTok после @бота',
+                    input_message_content=InputTextMessageContent(
+                        message_text='Вставьте ссылку TikTok чтобы скачать видео через @HataniSquadBot'
+                    ),
+                )
+            ],
+            cache_time=1,
+            switch_pm_text='Открыть бот',
+            switch_pm_parameter='start',
+        )
+        return
+
+    url = match.group(0)
+    cache_key_high = f'high|{url}'
+    cache_key_normal = f'normal|{url}'
+    cached = await get_cached_video(cache_key_high) or await get_cached_video(cache_key_normal)
+
+    if cached and cached.get('file_id'):
+        uploader = html.escape(str(cached.get('uploader') or 'TikTok'))
+        desc_raw = str(cached.get('description') or '')[:60]
+        await query.answer(
+            results=[
+                InlineQueryResultCachedVideo(
+                    id=f'cached_{url[-16:]}',
+                    video_file_id=cached['file_id'],
+                    title=f'{uploader} — TikTok видео',
+                    description=desc_raw or 'TikTok видео из кэша',
+                    caption=f'📥 via @HataniSquadBot',
+                )
+            ],
+            cache_time=300,
+        )
+    else:
+        await query.answer(
+            results=[
+                InlineQueryResultArticle(
+                    id='download',
+                    title='📥 Скачать это видео TikTok',
+                    description='Нажми — бот скачает и отправит видео в чат',
+                    input_message_content=InputTextMessageContent(message_text=url),
+                )
+            ],
+            cache_time=1,
+            switch_pm_text='Скачать через бот',
+            switch_pm_parameter='start',
+        )

@@ -1,6 +1,7 @@
 import asyncio
 import glob
 import datetime
+import threading
 import json
 import os
 import re
@@ -14,6 +15,42 @@ import uuid
 from yt_dlp import YoutubeDL
 
 from core.config import DOWNLOAD_DIR
+
+
+class DownloadProgressTracker:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.percent: float = 0.0
+        self.speed_str: str = ''
+        self.eta_str: str = ''
+        self.total_str: str = ''
+        self.status: str = 'starting'
+
+    def hook(self, d: dict) -> None:
+        with self._lock:
+            if d['status'] == 'downloading':
+                try:
+                    raw = str(d.get('_percent_str') or '0').strip().rstrip('%')
+                    self.percent = float(raw or 0)
+                except (ValueError, TypeError):
+                    pass
+                self.speed_str = str(d.get('_speed_str') or '').strip()
+                self.eta_str = str(d.get('_eta_str') or '').strip()
+                self.total_str = str(d.get('_total_bytes_str') or d.get('_total_bytes_estimate_str') or '').strip()
+                self.status = 'downloading'
+            elif d['status'] == 'finished':
+                self.percent = 100.0
+                self.status = 'finished'
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                'percent': self.percent,
+                'speed': self.speed_str,
+                'eta': self.eta_str,
+                'total': self.total_str,
+                'status': self.status,
+            }
 
 
 def parse_fps(fps_str) -> int:
@@ -472,6 +509,44 @@ class TikTokDownloader:
     def get_local_video_info(self, file_path: str) -> dict:
         return self._get_local_video_info(file_path)
 
+    def _ensure_telegram_compatible(self, file_path: str) -> str:
+        MAX_SIDE = 1920
+        info = self._get_local_video_info(file_path)
+        width = info.get('width', 0)
+        height = info.get('height', 0)
+
+        if not width or not height or max(width, height) <= MAX_SIDE:
+            return file_path
+
+        if width >= height:
+            new_w, new_h = MAX_SIDE, int(height * MAX_SIDE / width)
+        else:
+            new_h, new_w = MAX_SIDE, int(width * MAX_SIDE / height)
+
+        new_w -= new_w % 2
+        new_h -= new_h % 2
+
+        out = file_path.replace('.mp4', '_compat.mp4')
+        cmd = [
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
+            '-i', file_path,
+            '-vf', f'scale={new_w}:{new_h}',
+            '-c:v', 'libx264', '-crf', '23', '-preset', 'fast',
+            '-profile:v', 'main', '-level', '4.1',
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart',
+            out,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0 and os.path.exists(out):
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+            return out
+        return file_path
+
     def _probe_video_sync(self, url: str) -> dict:
         source_url, is_tiktok_album = self._normalize_tiktok_url(url)
         if not source_url:
@@ -549,10 +624,10 @@ class TikTokDownloader:
     async def probe_video(self, url: str) -> dict:
         return await asyncio.to_thread(self._probe_video_sync, url)
 
-    async def download_video(self, url: str, quality: str = 'high', format_id: str | None = None) -> dict:
-        return await asyncio.to_thread(self._download_video_sync, url, quality, format_id)
+    async def download_video(self, url: str, quality: str = 'high', format_id: str | None = None, progress_tracker=None) -> dict:
+        return await asyncio.to_thread(self._download_video_sync, url, quality, format_id, progress_tracker)
 
-    def _download_video_sync(self, url: str, quality: str = 'high', format_id: str | None = None) -> dict:
+    def _download_video_sync(self, url: str, quality: str = 'high', format_id: str | None = None, progress_tracker=None) -> dict:
         source_url, is_tiktok_album = self._normalize_tiktok_url(url)
         if not source_url:
             return {
@@ -586,9 +661,15 @@ class TikTokDownloader:
         ydl_opts.update({
             'format': format_selector,
             'outtmpl': f'{self.download_path}/{filename_id}.%(ext)s',
-            'format_sort': ['res', 'fps', 'br', 'size'],
+            'format_sort': ['vcodec:h264', 'res', 'fps', 'br', 'size'],
             'merge_output_format': 'mp4',
+            'postprocessor_args': {
+                'ffmpeg': ['-movflags', '+faststart', '-pix_fmt', 'yuv420p'],
+            },
         })
+
+        if progress_tracker is not None:
+            ydl_opts['progress_hooks'] = [progress_tracker.hook]
 
         self._apply_cookie_file(ydl_opts)
 
@@ -603,6 +684,7 @@ class TikTokDownloader:
                     raise FileNotFoundError('Downloaded file not found')
 
                 file_path = files[0]
+                file_path = self._ensure_telegram_compatible(file_path)
                 download_time = time.time() - start_time
                 file_size = os.path.getsize(file_path)
 
